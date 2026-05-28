@@ -122,38 +122,56 @@ GASのプロジェクト設定で、以下のスクリプトプロパティ（Sc
 
 ---
 
-## 🛠️ 実装計画 (Implementation Plan)
+## 🛠️ 実装ログ
 
-### 概要と目標
-はてなブックマークRSSの収集、記事スクレイピング、Gemini APIによる要約、はてブコメント取得、およびSlack通知を統合したGASスクリプトを `src/Code.js` として実装します。フロントエンドUI (`Index.html`) は不要になったため作成しません。
+### フェーズ1: コアロジック実装 ✅ 完了
 
-### 提案される変更詳細
+#### バックエンド: [src/Code.js](src/Code.js)
+- **`doGet(e)`**: WebアプリのURLパラメータ `token` を検証し、一致すれば `syncAndNotify()` を実行して結果をJSON形式で返却。
+- **`checkToken(token)`**: `token` が `APP_SECRET` に一致するか判定。
+- **`runCron()`**: 定期実行用エントリポイント。トークン不要でクローラーおよび通知を実行。
+- **`syncAndNotify()`**:
+  1. はてなブックマーク RSS から最新記事を取得。
+  2. スプレッドシート「Articles」シートから送信済URL履歴を読み込み、新着記事（最大10件）を抽出。
+  3. 各記事のWebページをスクレイピングし、不要タグを除去してプレーンテキスト（上限8,000文字）を抽出。
+  4. Gemini 2.5 Flash API へリクエストし、日本語要約を生成。
+  5. はてなブックマーク JSONLite API からブコメ（最大5件）を取得。
+  6. Slack Block Kit メッセージを構築し、Webhook へ POST。
+  7. 送信済URLをスプレッドシート先頭に追記（100件超の古い行を自動削除）。
 
-#### バックエンド: [Code.js](src/Code.js) [NEW]
-- **`doGet(e)`**: WebアプリのURLパラメータ `token` を検証し、一致すれば `triggerSync()` を実行して結果をJSON形式で返却する。
-- **`checkToken(token)`**: `token` が `APP_SECRET` に一致するか判定する。
-- **`runCron()`**: 定期実行用エントリポイント。トークン不要でクローラーおよび通知を実行する。
-- **クローラー・通知ロジック (`syncAndNotify()`)**:
-  - はてなブックマークのRSSから最新記事を取得（デフォルト: `https://b.hatena.ne.jp/hotentry/it.rss`）。
-  - スプレッドシートの「Articles」シートから送信済URL履歴を読み込み、重複しない新着記事（最大10件）を抽出。
-  - 各記事について以下を実行：
-    1. `UrlFetchApp.fetch` で本文ページをスクレイピングし、スクリプトやスタイル、不要なタグを除去してプレーンテキストを抽出（上限8,000文字）。
-    2. Gemini 2.5 Flash API にリクエストを送り、記事内容の「日本語要約（制約なし）」を生成。
-    3. はてなブックマークの JSONLite API (`https://b.hatena.ne.jp/entry/jsonlite/?url=...`) を呼び出し、コメント（最大5件、空でないもの）を取得。
-    4. 収集した要約とコメントから Slack の Block Kit メッセージ（見出し、要約、ブコメ、リンク）を構築。
-    5. Slack Webhook へPOST送信。
-    6. スプレッドシートの「Articles」シートの先頭にURLを追記（履歴件数が100件を超える場合は古い行を自動削除し、パフォーマンスを維持）。
+#### 検証ステータス ✅
+- GASエディタから `runCron` を手動実行し、RSS取得〜Gemini要約〜Slack通知の全フローが正常動作することを確認済み。
 
-### 検証とロードマップ
+---
 
-#### 検証ステータス (検証完了)
-- GASエディタからの `runCron` 手動実行による統合テストが成功し、RSS取得〜要約〜Slack通知までの全フローが正常に機能することが確認できました。
-- 各個別機能（スクレイピング、Gemini要約、ブコメ取得等）も実環境で問題なく動作したため、個別のデバッグ用テスト関数の追加実装は一旦不要としています。
+### フェーズ2: CI/CD環境構築 ✅ 完了
 
-#### 今後のロードマップ (発展の方向性)
-本プロジェクトの今後の改善・拡張アイデアとして以下を想定しています。
-1. **ローカル開発・テスト環境の構築**:
-   - `clasp` と `Jest` を導入し、ローカルでの単体テスト実行とCLIからのGASへのデプロイを可能にする。
-   - GitHub Actions 等と連携し、テストやデプロイの自動化 (CI/CD) を実現する。
-2. **Slack通知の機能拡張**:
-   - Block Kit のインタラクティブ機能（ボタン等）を活用し、Slack上からの追加アクションなどを検討する。
+#### 構成ファイル
+- **[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)**: `main` ブランチへのプッシュをトリガーに、テスト（Jest）→ GAS へのデプロイ（`clasp push`）を自動実行するワークフロー。
+- **[`package.json`](package.json)**: `clasp`・`jest`・`@types/google-apps-script` を devDependencies に追加。
+- **[`src/Code.test.js`](src/Code.test.js)**: Jest テストのエントリポイント。
+- **[`.clasp.json.sample`](.clasp.json.sample)**: `scriptId` 設定のサンプルファイル（実際の `.clasp.json` は `.gitignore` で除外）。
+
+#### GitHub Secrets の設定 ✅
+| Secret名 | 内容 |
+| :--- | :--- |
+| `CLASPRC_JSON` | `~/.clasprc.json` の中身（`npx clasp login` で生成される認証情報） |
+
+#### CI/CDフロー
+```
+git push (main) → GitHub Actions 起動
+  → npm ci（依存パッケージインストール）
+  → npm test（Jest テスト実行）
+  → clasp push -f（GASへデプロイ）
+```
+
+---
+
+## 🗺️ 今後のロードマップ
+
+### フェーズ3: テストの拡充 (次の作業)
+- `src/Code.js` の各関数（`checkToken`, `syncAndNotify` 等）に対する単体テストを `src/Code.test.js` へ実装する。
+- GASのグローバルオブジェクト（`UrlFetchApp`, `SpreadsheetApp`, `PropertiesService` 等）をJestでモック化し、ローカル環境で完結したテストを実現する。
+
+### フェーズ4: Slack通知の機能拡張
+- Block Kit のインタラクティブ機能（ボタン等）を活用し、Slack上からの追加アクション（例: 記事の保存、既読マーク等）を検討する。
