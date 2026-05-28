@@ -1,0 +1,26 @@
+{
+  "name": "ai-hatebu-digest",
+  "version": "1.0.0",
+  "description": "はてなブックマークのホットエントリー（テクノロジーカテゴリ）から記事を自動取得し、Geminiで要約したものをSlackに通知する、**Google Apps Script (GAS)** と **Google スプレッドシート** を使った完全無料のシステムです。",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lightyield/ai-hatebu-digest.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/lightyield/ai-hatebu-digest/issues"
+  },
+  "homepage": "https://github.com/lightyield/ai-hatebu-digest#readme",
+  "devDependencies": {
+    "@google/clasp": "^3.3.0",
+    "@types/google-apps-script": "^2.0.9",
+    "jest": "^30.4.2"
+  }
+}
