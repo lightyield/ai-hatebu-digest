@@ -156,22 +156,44 @@ GASのプロジェクト設定で、以下のスクリプトプロパティ（Sc
 | Secret名 | 内容 |
 | :--- | :--- |
 | `CLASPRC_JSON` | `~/.clasprc.json` の中身（`npx clasp login` で生成される認証情報） |
+| `CLASP_JSON` | `.clasp.json` の中身（`scriptId` と `rootDir` を含むJSON）。`.clasp.json` は `.gitignore` で除外されているため、CI環境でファイルを再生成するために必要 |
 
 #### CI/CDフロー
 ```
 git push (main) → GitHub Actions 起動
   → npm ci（依存パッケージインストール）
   → npm test（Jest テスト実行）
+  → ~/.clasprc.json を CLASPRC_JSON シークレットから生成
+  → .clasp.json を CLASP_JSON シークレットから生成
   → clasp push -f（GASへデプロイ）
 ```
+
+#### 修正履歴
+- **Node.js 20 → 24 に更新**: `actions/checkout@v4` / `actions/setup-node@v4` の Node.js 20 非推奨警告を解消。
+- **`CLASP_JSON` シークレット追加**: `.clasp.json` が `.gitignore` で除外されているため CI 環境に存在せず `clasp push` が失敗していた問題を修正。シークレットからファイルを生成するステップを追加。
 
 ---
 
 ## 🗺️ 今後のロードマップ
 
-### フェーズ3: テストの拡充 (次の作業)
-- `src/Code.js` の各関数（`checkToken`, `syncAndNotify` 等）に対する単体テストを `src/Code.test.js` へ実装する。
-- GASのグローバルオブジェクト（`UrlFetchApp`, `SpreadsheetApp`, `PropertiesService` 等）をJestでモック化し、ローカル環境で完結したテストを実現する。
+### フェーズ3: テストの拡充 ✅ 完了
 
-### フェーズ4: Slack通知の機能拡張
+#### テストファイル: [src/Code.test.js](src/Code.test.js)
+- GASのグローバルオブジェクト（`PropertiesService`, `UrlFetchApp`, `XmlService`, `SpreadsheetApp`, `ContentService`, `Utilities`）を Jest でモック化し、ローカル環境で完結したテストを実現。
+- 全関数をカバーする **20件** のテストケースを実装。
+  | 関数 | テスト数 | 主なテスト内容 |
+  | :--- | :---: | :--- |
+  | `getProperties()` | 2 | プロパティ取得、デフォルトURL |
+  | `checkToken()` | 4 | 正常・誤り・null・空文字 |
+  | `doGet()` | 4 | 認証成功・失敗・例外ハンドリング |
+  | `runCron()` | 2 | 正常終了・例外の非伝播 |
+  | `syncAndNotify()` | 8 | シート不在・新着0件・重複除外・保存・削除・API失敗時の継続・最大10件制限 |
+- `src/Code.js` 末尾に `typeof module !== 'undefined'` ガード付きの `module.exports` を追加（GAS本番環境への影響なし）。
+
+#### 検証ステータス ✅
+- `npm test` ローカル実行で 20 tests passed を確認済み。
+
+---
+
+### フェーズ4: Slack通知の機能拡張 (次の作業)
 - Block Kit のインタラクティブ機能（ボタン等）を活用し、Slack上からの追加アクション（例: 記事の保存、既読マーク等）を検討する。
