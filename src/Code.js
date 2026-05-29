@@ -275,3 +275,10 @@ function testSlackNotification() {
   });
   console.log("Slack にテスト通知を送信しました。");
 }
+
+// ----------------------------------------------------
+// Jest テスト用エクスポート (GAS本番環境では無視される)
+// ----------------------------------------------------
+if (typeof module !== 'undefined') {
+  module.exports = { getProperties, doGet, checkToken, runCron, syncAndNotify };
+}
