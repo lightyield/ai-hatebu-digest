@@ -75,7 +75,7 @@ function syncAndNotify() {
     
     if (!sentUrls.includes(url)) {
       newArticles.push({ url, title });
-      if (newArticles.length >= 10) break;
+      if (newArticles.length >= 3) break;
     }
   }
   
@@ -86,135 +86,139 @@ function syncAndNotify() {
   for (let i = 0; i < newArticles.length; i++) {
     const article = newArticles[i];
     
-    // a. 記事本文のスクレイピング
-    let textContent = "";
     try {
-      const pageRes = UrlFetchApp.fetch(article.url, {muteHttpExceptions: true});
-      if (pageRes.getResponseCode() === 200) {
-        let html = pageRes.getContentText();
-        // script, style タグの除去とプレーンテキストの抽出
-        html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ');
-        html = html.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ');
-        html = html.replace(/<[^>]+>/g, ' '); // HTMLタグを除去
-        html = html.replace(/\s+/g, ' ').trim(); // 空白を正規化
-        
-        textContent = html.substring(0, 8000); // 制限を設ける
-      }
-    } catch (e) {
-      console.warn("スクレイピング失敗: " + article.url, e);
-    }
-    
-    if (!textContent) textContent = "本文の抽出に失敗しました。";
-    
-    // b. Gemini APIによる要約
-    let summary = "要約を取得できませんでした。";
-    try {
-      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${props.GEMINI_API_KEY}`;
-      const payload = {
-        contents: [{
-          parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
-        }]
-      };
-      const geminiRes = UrlFetchApp.fetch(geminiUrl, {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-      });
-      if (geminiRes.getResponseCode() === 200) {
-        const geminiData = JSON.parse(geminiRes.getContentText());
-        if (geminiData.candidates && geminiData.candidates.length > 0) {
-          summary = geminiData.candidates[0].content.parts[0].text;
+      // a. 記事本文のスクレイピング
+      let textContent = "";
+      try {
+        const pageRes = UrlFetchApp.fetch(article.url, {muteHttpExceptions: true});
+        if (pageRes.getResponseCode() === 200) {
+          let html = pageRes.getContentText();
+          // script, style タグ of 除去 and プレーンテキスト of 抽出
+          html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ');
+          html = html.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ');
+          html = html.replace(/<[^>]+>/g, ' '); // HTMLタグを除去
+          html = html.replace(/\s+/g, ' ').trim(); // 空白を正規化
+          
+          textContent = html.substring(0, 8000); // 制限を設ける
         }
-      } else {
-        console.warn("Gemini API Error: ", geminiRes.getContentText());
+      } catch (e) {
+        console.warn("スクレイピング失敗: " + article.url, e);
       }
-    } catch (e) {
-      console.warn("Gemini API呼び出し失敗: " + article.url, e);
-    }
-    
-    // c. はてなブックマーク JSONLite API でブコメ取得
-    let commentsText = "";
-    try {
-      const bApiUrl = `https://b.hatena.ne.jp/entry/jsonlite/?url=${encodeURIComponent(article.url)}`;
-      const bRes = UrlFetchApp.fetch(bApiUrl, {muteHttpExceptions: true});
-      if (bRes.getResponseCode() === 200) {
-        const bData = JSON.parse(bRes.getContentText());
-        if (bData && bData.bookmarks) {
-          // コメントが空でないものを最大5件抽出
-          const comments = bData.bookmarks.filter(b => b.comment.trim() !== "").slice(0, 5);
-          if (comments.length > 0) {
-            commentsText = comments.map(c => `• *${c.user}*: ${c.comment}`).join('\n');
-          } else {
-            commentsText = "コメントはまだありません。";
+      
+      if (!textContent) textContent = "本文の抽出に失敗しました。";
+      
+      // b. Gemini APIによる要約
+      let summary = "要約を取得できませんでした。";
+      try {
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${props.GEMINI_API_KEY}`;
+        const payload = {
+          contents: [{
+            parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
+          }]
+        };
+        const geminiRes = UrlFetchApp.fetch(geminiUrl, {
+          method: 'post',
+          contentType: 'application/json',
+          payload: JSON.stringify(payload),
+          muteHttpExceptions: true
+        });
+        if (geminiRes.getResponseCode() === 200) {
+          const geminiData = JSON.parse(geminiRes.getContentText());
+          if (geminiData.candidates && geminiData.candidates.length > 0) {
+            summary = geminiData.candidates[0].content.parts[0].text;
+          }
+        } else {
+          console.warn("Gemini API Error: ", geminiRes.getContentText());
+        }
+      } catch (e) {
+        console.warn("Gemini API呼び出し失敗: " + article.url, e);
+      }
+      
+      // c. はてなブックマーク JSONLite API でブコメ取得
+      let commentsText = "";
+      try {
+        const bApiUrl = `https://b.hatena.ne.jp/entry/jsonlite/?url=${encodeURIComponent(article.url)}`;
+        const bRes = UrlFetchApp.fetch(bApiUrl, {muteHttpExceptions: true});
+        if (bRes.getResponseCode() === 200) {
+          const bData = JSON.parse(bRes.getContentText());
+          if (bData && bData.bookmarks) {
+            // コメントが空でないものを最大5件抽出
+            const comments = bData.bookmarks.filter(b => b.comment.trim() !== "").slice(0, 5);
+            if (comments.length > 0) {
+              commentsText = comments.map(c => `• *${c.user}*: ${c.comment}`).join('\n');
+            } else {
+              commentsText = "コメントはまだありません。";
+            }
           }
         }
+      } catch (e) {
+        console.warn("はてなブコメ取得失敗: " + article.url, e);
+        commentsText = "コメントの取得に失敗しました。";
       }
-    } catch (e) {
-      console.warn("はてなブコメ取得失敗: " + article.url, e);
-      commentsText = "コメントの取得に失敗しました。";
-    }
-    if (!commentsText) commentsText = "コメントはまだありません。";
-    
-    // d. Slack Block Kit メッセージの構築
-    const blocks = [
-      {
-        "type": "header",
-        "text": {
-          "type": "plain_text",
-          "text": article.title,
-          "emoji": true
+      if (!commentsText) commentsText = "コメントはまだありません。";
+      
+      // d. Slack Block Kit メッセージの構築
+      const blocks = [
+        {
+          "type": "header",
+          "text": {
+            "type": "plain_text",
+            "text": article.title,
+            "emoji": true
+          }
+        },
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": `<${article.url}|記事を開く>`
+          }
+        },
+        {
+          "type": "divider"
+        },
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": `*✨ AI 要約*\n${summary}`
+          }
+        },
+        {
+          "type": "divider"
+        },
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": `*💬 人気ブコメ*\n${commentsText}`
+          }
         }
-      },
-      {
-        "type": "section",
-        "text": {
-          "type": "mrkdwn",
-          "text": `<${article.url}|記事を開く>`
-        }
-      },
-      {
-        "type": "divider"
-      },
-      {
-        "type": "section",
-        "text": {
-          "type": "mrkdwn",
-          "text": `*✨ AI 要約*\n${summary}`
-        }
-      },
-      {
-        "type": "divider"
-      },
-      {
-        "type": "section",
-        "text": {
-          "type": "mrkdwn",
-          "text": `*💬 人気ブコメ*\n${commentsText}`
-        }
+      ];
+      
+      // e. Slackへの送信
+      try {
+        UrlFetchApp.fetch(props.SLACK_WEBHOOK_URL, {
+          method: 'post',
+          contentType: 'application/json',
+          payload: JSON.stringify({ blocks: blocks }),
+          muteHttpExceptions: true
+        });
+      } catch (e) {
+        console.error("Slack通知失敗", e);
       }
-    ];
-    
-    // e. Slackへの送信
-    try {
-      UrlFetchApp.fetch(props.SLACK_WEBHOOK_URL, {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify({ blocks: blocks }),
-        muteHttpExceptions: true
-      });
-    } catch (e) {
-      console.error("Slack通知失敗", e);
+      
+      // f. スプレッドシートに送信済URLを保存 (先頭に挿入)
+      sheet.insertRowBefore(1);
+      sheet.getRange(1, 1).setValue(article.url);
+      
+      processedCount++;
+    } catch (err) {
+      console.error("記事の処理中に重大なエラーが発生しました (" + article.url + "): ", err);
+    } finally {
+      // APIレートリミットを考慮して少し待機
+      Utilities.sleep(1500);
     }
-    
-    // f. スプレッドシートに送信済URLを保存 (先頭に挿入)
-    sheet.insertRowBefore(1);
-    sheet.getRange(1, 1).setValue(article.url);
-    
-    processedCount++;
-    
-    // APIレートリミットを考慮して少し待機
-    Utilities.sleep(1500);
   }
   
   // 100件を超える古い履歴の削除
