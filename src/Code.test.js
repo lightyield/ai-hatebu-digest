@@ -367,17 +367,39 @@ describe('syncAndNotify()', () => {
     expect(count).toBe(1);
   });
 
-  it('最大10件を超えるRSS記事が来ても10件のみ処理する', () => {
+  it('最大3件を超えるRSS記事が来ても3件のみ処理する', () => {
     const articles = Array.from({ length: 15 }, (_, i) => ({
       url: `https://example.com/article${i + 1}`,
       title: `記事${i + 1}`,
     }));
 
     setupXmlServiceMock(articles);
-    setupFetchMocksForArticles(articles.slice(0, 10));
+    setupFetchMocksForArticles(articles.slice(0, 3));
 
     const count = syncAndNotify();
-    expect(count).toBe(10);
+    expect(count).toBe(3);
+  });
+
+  it('ある記事の処理中に重大な例外が発生しても、他の記事の処理を継続する', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: 'テスト記事1' },
+      { url: 'https://example.com/article2', title: 'テスト記事2' },
+    ];
+
+    setupXmlServiceMock(articles);
+    setupFetchMocksForArticles(articles);
+
+    // 1件目のスプレッドシートへの保存処理 (insertRowBefore) で例外を発生させる
+    mockSheet.insertRowBefore.mockImplementationOnce(() => {
+      throw new Error('Database write error');
+    });
+
+    const count = syncAndNotify();
+    
+    // 1件目は例外でカウントされず（processedCount++がスキップされる）、2件目は正常にカウントされるため合計1になる
+    expect(count).toBe(1);
+    // insertRowBefore は2回とも呼ばれるはず
+    expect(mockSheet.insertRowBefore).toHaveBeenCalledTimes(2);
   });
 });
 
