@@ -110,28 +110,52 @@ function syncAndNotify() {
       // b. Gemini APIによる要約
       let summary = "要約を取得できませんでした。";
       try {
-        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${props.GEMINI_API_KEY}`;
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${props.GEMINI_API_KEY}`;
         const payload = {
           contents: [{
             parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
           }]
         };
-        const geminiRes = UrlFetchApp.fetch(geminiUrl, {
-          method: 'post',
-          contentType: 'application/json',
-          payload: JSON.stringify(payload),
-          muteHttpExceptions: true
-        });
-        if (geminiRes.getResponseCode() === 200) {
-          const geminiData = JSON.parse(geminiRes.getContentText());
-          if (geminiData.candidates && geminiData.candidates.length > 0) {
-            summary = geminiData.candidates[0].content.parts[0].text;
+        
+        const maxAttempts = 3;
+        let delayMs = 2000;
+        
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+            const geminiRes = UrlFetchApp.fetch(geminiUrl, {
+              method: 'post',
+              contentType: 'application/json',
+              payload: JSON.stringify(payload),
+              muteHttpExceptions: true
+            });
+            
+            const responseCode = geminiRes.getResponseCode();
+            if (responseCode === 200) {
+              const geminiData = JSON.parse(geminiRes.getContentText());
+              if (geminiData.candidates && geminiData.candidates.length > 0) {
+                summary = geminiData.candidates[0].content.parts[0].text;
+                break;
+              }
+            } else if (responseCode === 503 || responseCode === 429) {
+              console.warn(`Gemini API 一時的エラー (${responseCode}) - リトライ試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
+              if (attempt < maxAttempts) {
+                Utilities.sleep(delayMs);
+                delayMs *= 2; // 指数バックオフ
+              }
+            } else {
+              console.warn(`Gemini API エラー (${responseCode}): `, geminiRes.getContentText());
+              break; // 400等の致命的/恒常的エラーはリトライしない
+            }
+          } catch (e) {
+            console.warn(`Gemini API 接続エラー - リトライ試行 ${attempt}/${maxAttempts}: ` + article.url, e);
+            if (attempt < maxAttempts) {
+              Utilities.sleep(delayMs);
+              delayMs *= 2;
+            }
           }
-        } else {
-          console.warn("Gemini API Error: ", geminiRes.getContentText());
         }
       } catch (e) {
-        console.warn("Gemini API呼び出し失敗: " + article.url, e);
+        console.warn("Gemini API要約処理プロセス全体で例外が発生しました: " + article.url, e);
       }
       
       // c. はてなブックマーク JSONLite API でブコメ取得
