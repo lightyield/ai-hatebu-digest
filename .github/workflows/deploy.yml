@@ -26,15 +26,15 @@ jobs:
 
       - name: Create ~/.clasprc.json
         run: |
-          echo "$CLASPRC_JSON" > ~/.clasprc.json
-        env:
-          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          cat << 'EOF' > ~/.clasprc.json
+          ${{ secrets.CLASPRC_JSON }}
+          EOF
 
       - name: Create .clasp.json
         run: |
-          echo "$CLASP_JSON" > .clasp.json
-        env:
-          CLASP_JSON: ${{ secrets.CLASP_JSON }}
+          cat << 'EOF' > .clasp.json
+          ${{ secrets.CLASP_JSON }}
+          EOF
 
       - name: Deploy with clasp
         run: npx clasp push -f
