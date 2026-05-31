@@ -380,6 +380,78 @@ describe('syncAndNotify()', () => {
     expect(count).toBe(3);
   });
 
+  it('記事ページへのアクセスがHTTPエラー(403等)の場合、要約をスキップしSlack通知しカウントする', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: 'アクセス制限記事' },
+    ];
+
+    setupXmlServiceMock(articles);
+
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      // 記事ページ: 403を返す
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => 'Forbidden'),
+          getResponseCode: jest.fn(() => 403),
+        };
+      }
+      // Slack Webhook
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+
+    // スキップでも1件としてカウントされる
+    expect(count).toBe(1);
+    // スプレッドシートにURLが保存される
+    expect(mockSheet.insertRowBefore).toHaveBeenCalledWith(1);
+  });
+
+  it('記事ページの本文テキストが空の場合、要約をスキップしSlack通知しカウントする', () => {
+    const articles = [
+      { url: 'https://example.com/article2', title: '空コンテンツ記事' },
+    ];
+
+    setupXmlServiceMock(articles);
+
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      // 記事ページ: 200だがHTMLが空（タグのみで本文なし）
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><head></head><body></body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      // Slack Webhook
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+
+    // スキップでも1件としてカウントされる
+    expect(count).toBe(1);
+    // スプレッドシートにURLが保存される
+    expect(mockSheet.insertRowBefore).toHaveBeenCalledWith(1);
+  });
+
   it('ある記事の処理中に重大な例外が発生しても、他の記事の処理を継続する', () => {
     const articles = [
       { url: 'https://example.com/article1', title: 'テスト記事1' },

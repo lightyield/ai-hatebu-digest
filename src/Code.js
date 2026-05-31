@@ -89,9 +89,12 @@ function syncAndNotify() {
     try {
       // a. 記事本文のスクレイピング
       let textContent = "";
+      let scrapeSkipped = false;
+      let scrapeSkipReason = "";
       try {
         const pageRes = UrlFetchApp.fetch(article.url, {muteHttpExceptions: true});
-        if (pageRes.getResponseCode() === 200) {
+        const responseCode = pageRes.getResponseCode();
+        if (responseCode === 200) {
           let html = pageRes.getContentText();
           // script, style タグ of 除去 and プレーンテキスト of 抽出
           html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ');
@@ -100,12 +103,70 @@ function syncAndNotify() {
           html = html.replace(/\s+/g, ' ').trim(); // 空白を正規化
           
           textContent = html.substring(0, 8000); // 制限を設ける
+        } else {
+          // 200以外のステータスコード（ペイウォール、リダイレクト、複数ページ等）
+          scrapeSkipped = true;
+          scrapeSkipReason = `記事本文へのアクセスに失敗しました（HTTPステータス: ${responseCode}）。複数ページ構成やアクセス制限の可能性があります。`;
+          console.warn("スクレイピングスキップ (" + responseCode + "): " + article.url);
         }
       } catch (e) {
+        scrapeSkipped = true;
+        scrapeSkipReason = "記事本文の取得中にエラーが発生しました。";
         console.warn("スクレイピング失敗: " + article.url, e);
       }
       
-      if (!textContent) textContent = "本文の抽出に失敗しました。";
+      // テキストが取れなかった場合もスキップ扱い
+      if (!scrapeSkipped && !textContent) {
+        scrapeSkipped = true;
+        scrapeSkipReason = "記事本文のテキストを抽出できませんでした。複数ページ構成や動的コンテンツの可能性があります。";
+      }
+      
+      // スキップ時: Slack通知してスプレッドシートに保存し次の記事へ
+      if (scrapeSkipped) {
+        console.warn("記事をスキップします: " + article.url);
+        const skipBlocks = [
+          {
+            "type": "header",
+            "text": {
+              "type": "plain_text",
+              "text": article.title,
+              "emoji": true
+            }
+          },
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": `<${article.url}|記事を開く>`
+            }
+          },
+          {
+            "type": "divider"
+          },
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": `:warning: *要約スキップ*\n${scrapeSkipReason}`
+            }
+          }
+        ];
+        try {
+          UrlFetchApp.fetch(props.SLACK_WEBHOOK_URL, {
+            method: 'post',
+            contentType: 'application/json',
+            payload: JSON.stringify({ blocks: skipBlocks }),
+            muteHttpExceptions: true
+          });
+        } catch (e) {
+          console.error("スキップ通知のSlack送信失敗", e);
+        }
+        // スキップ記事もスプレッドシートに保存してカウント
+        sheet.insertRowBefore(1);
+        sheet.getRange(1, 1).setValue(article.url);
+        processedCount++;
+        continue;
+      }
       
       // b. Gemini APIによる要約
       let summary = "要約を取得できませんでした。";
@@ -235,7 +296,7 @@ function syncAndNotify() {
       // f. スプレッドシートに送信済URLを保存 (先頭に挿入)
       sheet.insertRowBefore(1);
       sheet.getRange(1, 1).setValue(article.url);
-      
+
       processedCount++;
     } catch (err) {
       console.error("記事の処理中に重大なエラーが発生しました (" + article.url + "): ", err);
