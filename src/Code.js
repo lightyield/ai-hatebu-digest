@@ -227,8 +227,8 @@ function syncAndNotify() {
         if (bRes.getResponseCode() === 200) {
           const bData = JSON.parse(bRes.getContentText());
           if (bData && bData.bookmarks) {
-            // コメントが空でないものを最大5件抽出
-            const comments = bData.bookmarks.filter(b => b.comment.trim() !== "").slice(0, 5);
+            // コメントが空でないものを最大10件抽出
+            const comments = bData.bookmarks.filter(b => b.comment.trim() !== "").slice(0, 10);
             if (comments.length > 0) {
               commentsText = comments.map(c => `• *${c.user}*: ${c.comment}`).join('\n');
             } else {
@@ -276,7 +276,7 @@ function syncAndNotify() {
           "type": "section",
           "text": {
             "type": "mrkdwn",
-            "text": `*💬 人気ブコメ*\n${commentsText}`
+            "text": `*💬 新着ブコメ*\n${commentsText}`
           }
         }
       ];
