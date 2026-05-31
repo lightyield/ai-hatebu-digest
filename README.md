@@ -47,19 +47,23 @@ sequenceDiagram
     end
 ```
 
-### 💡 主な機能
+### 💡 主な機能・仕様
 1. **全自動定期実行 (1日1回など)**:
    - はてなブックマークのテクノロジーホットエントリーから新着記事を自動取得。
    - スプレッドシートの送信済履歴と比較し、重複するURLは自動除外。
    - 各記事の本文をスクレイピングし、Gemini APIを使用して要約。
    - はてなブックマークのEntry APIからコメント（ブコメ）を最大5件取得。
    - 新規記事（最大3件）をSlackチャンネルへ整形して通知。
-2. **Slack上での情報完結**:
+2. **堅牢性とエラーハンドリング**:
+   - **実行時間・API制限への配慮**: GASの実行時間制限やGemini APIの無料枠制限（15 RPM）を考慮し、1回あたりの最大処理件数を **3件** に制限。また、APIリクエストの間に **1.5秒のウェイト** を挿入。
+   - **例外処理の徹底**: 各記事の処理を独立した `try-catch-finally` で囲み、一部の記事でスクレイピングや要約が失敗しても、残りの記事の処理に影響を与えない堅牢な設計。
+   - **アクセス不可記事のスキップ・記録**: 記事本文が403/404エラー等で取得できない場合や、文字数が空の場合は要約をスキップし、Slackに警告（⚠️）を通知。スキップされた記事も送信済履歴（スプレッドシート）に追加されるため、二重に処理されることはありません。
+3. **Slack上での情報完結**:
    - Slackの Block Kit 形式で、記事タイトル、Gemini要約、人気ブコメがスッキリとまとまったメッセージを配信。
-   - iPhoneやPCのSlackアプリからダイレクトに要約とユーザー反応を確認可能。
-3. **手動更新 (Webhook)**:
+   - モバイルやPCのSlackアプリからダイレクトに要約とユーザーの反応を確認可能。
+4. **手動更新 (Webhook)**:
    - GASでデプロイしたWebアプリURLにアクセス（トークン付き）することで、いつでも手動で最新の情報を取得・要約・Slack送信可能。
-4. **ランニングコスト0円**:
+5. **ランニングコスト0円**:
    - ホスティング & API: Google Apps Script (0円)
    - データベース: Google スプレッドシート (0円)
    - AI要約: Gemini API (Google AI Studio: 0円, 15 RPM)
@@ -97,7 +101,7 @@ GASのプロジェクト設定で、以下のスクリプトプロパティ（Sc
 2. **Apps Script を開く**:
    - メニューの「拡張機能」 > 「Apps Script」を選択します。
 3. **コードの配置**:
-   - デフォルトで作成されている `コード.gs`（または `Code.gs`）に、`src/Code.js` のコードを貼り付けます。
+   - デフォルトで作成されている `コード.gs`（または `Code.gs`）に、[src/Code.js](src/Code.js) のコードを貼り付けます。
 4. **スクリプトプロパティの設定**:
    - 左メニューの歯車アイコン（プロジェクトの設定）をクリックします。
    - 画面下部の「スクリプトプロパティ」セクションで、「スクリプトプロパティを追加」をクリックし、`GEMINI_API_KEY`、`SLACK_WEBHOOK_URL`、`APP_SECRET` を設定し保存します。
@@ -122,97 +126,43 @@ GASのプロジェクト設定で、以下のスクリプトプロパティ（Sc
 
 ---
 
-## 🛠️ 実装ログ
+## 🧪 ローカルテストの実行
 
-### フェーズ1: コアロジック実装 ✅ 完了
+本プロジェクトでは、Google Apps Script (GAS) のグローバルオブジェクトを Jest 上でモック化し、ローカル環境で単体テストを実行できるようにしています。
 
-#### バックエンド: [src/Code.js](src/Code.js)
-- **`doGet(e)`**: WebアプリのURLパラメータ `token` を検証し、一致すれば `syncAndNotify()` を実行して結果をJSON形式で返却。
-- **`checkToken(token)`**: `token` が `APP_SECRET` に一致するか判定。
-- **`runCron()`**: 定期実行用エントリポイント。トークン不要でクローラーおよび通知を実行。
-- **`syncAndNotify()`**:
-  1. はてなブックマーク RSS から最新記事を取得。
-  2. スプレッドシート「Articles」シートから送信済URL履歴を読み込み、新着記事（最大10件）を抽出。
-  3. 各記事のWebページをスクレイピングし、不要タグを除去してプレーンテキスト（上限8,000文字）を抽出。
-  4. Gemini 2.5 Flash API へリクエストし、日本語要約を生成。
-  5. はてなブックマーク JSONLite API からブコメ（最大5件）を取得。
-  6. Slack Block Kit メッセージを構築し、Webhook へ POST。
-  7. 送信済URLをスプレッドシート先頭に追記（100件超の古い行を自動削除）。
+### テストの実行手順
+1. **依存パッケージのインストール**:
+   ```bash
+   npm install
+   ```
+2. **テストの実行**:
+   ```bash
+   npm test
+   ```
 
-#### 検証ステータス ✅
-- GASエディタから `runCron` を手動実行し、RSS取得〜Gemini要約〜Slack通知の全フローが正常動作することを確認済み。
+### テストの構成・特徴
+- **モック化**: `PropertiesService`, `UrlFetchApp`, `XmlService`, `SpreadsheetApp`, `ContentService`, `Utilities` などの GAS 固有クラスを Jest で擬似的に再現し、通信やストレージを伴わない高速なテストを実現しています。
+- **検証範囲**: [src/Code.test.js](src/Code.test.js) にて、トークン認証、エラーハンドリング、二重送信防止、一時的な API 障害時のリトライ/リカバリ処理、およびアクセス不可記事のスキップ仕様など、全23件のテストケースを網羅しています。
+- **本番との互換性**: [src/Code.js](src/Code.js) の末尾で `module.exports` をエクスポートする際、GASのランタイム環境を壊さないためのガード処理（`typeof module !== 'undefined'`）を施しています。
 
 ---
 
-### フェーズ2: CI/CD環境構築 ✅ 完了
+## 🤖 CI/CD デプロイ自動化
 
-#### 構成ファイル
-- **[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)**: `main` ブランチへのプッシュをトリガーに、テスト（Jest）→ GAS へのデプロイ（`clasp push`）を自動実行するワークフロー。
-- **[`package.json`](package.json)**: `clasp`・`jest`・`@types/google-apps-script` を devDependencies に追加。
-- **[`src/Code.test.js`](src/Code.test.js)**: Jest テストのエントリポイント。
-- **[`.clasp.json.sample`](.clasp.json.sample)**: `scriptId` 設定のサンプルファイル（実際の `.clasp.json` は `.gitignore` で除外）。
+GitHub Actions を利用し、`main` ブランチへのマージ/プッシュをトリガーにテスト実行と GAS へのデプロイを自動で行います。
 
-#### GitHub Secrets の設定 ✅
+### CI/CD フロー
+1. `main` ブランチへプッシュ
+2. GitHub Actions ワークフロー（[.github/workflows/deploy.yml](.github/workflows/deploy.yml)）が起動
+3. `npm ci` による依存関係のクリーンインストール
+4. `npm test` による Jest テストの実行 (全テストがパスすることを確認)
+5. シークレットから `.clasprc.json` と `.clasp.json` を生成
+6. `clasp push -f` を実行し、[src/Code.js](src/Code.js) などのソースコードを GAS にデプロイ
+
+### GitHub Secrets の設定
+リポジトリの Settings > Secrets and variables > Actions に以下のシークレットを登録する必要があります。
+
 | Secret名 | 内容 |
 | :--- | :--- |
-| `CLASPRC_JSON` | `~/.clasprc.json` の中身（`npx clasp login` で生成される認証情報） |
-| `CLASP_JSON` | `.clasp.json` の中身（`scriptId` と `rootDir` を含むJSON）。`.clasp.json` は `.gitignore` で除外されているため、CI環境でファイルを再生成するために必要 |
-
-#### CI/CDフロー
-```
-git push (main) → GitHub Actions 起動
-  → npm ci（依存パッケージインストール）
-  → npm test（Jest テスト実行）
-  → ~/.clasprc.json を CLASPRC_JSON シークレットから生成
-  → .clasp.json を CLASP_JSON シークレットから生成
-  → clasp push -f（GASへデプロイ）
-```
-
-#### 修正履歴
-- **Node.js 20 → 24 に更新**: `actions/checkout@v4` / `actions/setup-node@v4` の Node.js 20 非推奨警告を解消。
-- **`CLASP_JSON` シークレット追加**: `.clasp.json` が `.gitignore` で除外されているため CI 環境に存在せず `clasp push` が失敗していた問題を修正。シークレットからファイルを生成するステップを追加。
-
----
-
-## 🗺️ 今後のロードマップ
-
-### フェーズ3: テストの拡充 ✅ 完了
-
-#### テストファイル: [src/Code.test.js](src/Code.test.js)
-- GASのグローバルオブジェクト（`PropertiesService`, `UrlFetchApp`, `XmlService`, `SpreadsheetApp`, `ContentService`, `Utilities`）を Jest でモック化し、ローカル環境で完結したテストを実現。
-- 全関数をカバーする **20件** のテストケースを実装。
-  | 関数 | テスト数 | 主なテスト内容 |
-  | :--- | :---: | :--- |
-  | `getProperties()` | 2 | プロパティ取得、デフォルトURL |
-  | `checkToken()` | 4 | 正常・誤り・null・空文字 |
-  | `doGet()` | 4 | 認証成功・失敗・例外ハンドリング |
-  | `runCron()` | 2 | 正常終了・例外の非伝播 |
-  | `syncAndNotify()` | 8 | シート不在・新着0件・重複除外・保存・削除・API失敗時の継続・最大10件制限 |
-- `src/Code.js` 末尾に `typeof module !== 'undefined'` ガード付きの `module.exports` を追加（GAS本番環境への影響なし）。
-
-#### 検証ステータス ✅
-- `npm test` ローカル実行で 20 tests passed を確認済み。
-
----
-
-### フェーズ4: 処理件数の削減と耐障害性の向上 (try-catch 強化) ✅ 完了
-
-#### 改修内容: [src/Code.js](src/Code.js)
-- **1回あたりの最大処理件数を 3件 に削減**:
-  - GASの実行時間制限（90分/日）およびAPI制限の安全マージンを確保するため、新着記事の最大処理件数を `10` 件から `3` 件に減らしました。
-- **ループ内エラーハンドリングの強化 (try-catch-finally の導入)**:
-  - 記事ごとの処理（本文スクレイピング、Gemini API、ブコメAPI、スプレッドシート保存）全体を `try-catch-finally` で囲むことにより、いずれかの処理（特にスプレッドシートやAPI）で予期せぬ重大な例外が発生した場合でも、残りの記事の処理を中断させずに継続できるようにしました。
-  - レートリミット回避用のウェイト処理（`Utilities.sleep(1500)`）を `finally` に配置し、例外発生時でも必ずウェイトが実行され、Gemini APIの RPM 制限（15回/分）を安定して回避できるようにしました。
-- **全文アクセス不可の記事をスキップする機能を追加**:
-  - 記事ページのスクレイピング結果が HTTP 200 以外（403, 404, 429 等）の場合、または 200 でも本文テキストが空の場合（複数ページ構成・動的コンテンツ等）、その記事の要約処理をスキップします。
-  - スキップ時は Slack に ⚠️ 付きの通知（タイトル・URL・スキップ理由）を送信し、ユーザーに状況を伝えます。
-  - スキップした記事も処理済みとして **スプレッドシートの URL リストに追加** し、次回以降に重複して処理されないようにします。また、処理件数としても **1件としてカウント** します。
-
-#### テストファイル: [src/Code.test.js](src/Code.test.js)
-- 処理制限テストの期待値を `3` 件に変更。
-- ある記事の処理中に重大な例外が発生した場合でも、他の記事の処理がスキップされずに継続され、結果がカウントされることを検証する耐障害性テストを1件追加。
-- 記事ページが HTTP エラー（403 等）を返した場合にスキップし、Slack 通知・シート保存・カウントが行われることを検証するテストを1件追加。
-- 記事ページの本文テキストが空（タグのみ等）の場合もスキップし、同様の処理が行われることを検証するテストを1件追加。
-
-#### 検証ステータス ✅
-- ローカル環境での `npm test`（全23件）がすべてパスすることを確認済み。
+| `CLASPRC_JSON` | `~/.clasprc.json` の内容（ローカルで `npx clasp login` を実行して生成された認証用JSONデータ） |
+| `CLASP_JSON` | `.clasp.json` の内容（`scriptId` や `rootDir` などの設定情報を含むJSONデータ。セキュリティのためリポジトリにはコミットされません） |
