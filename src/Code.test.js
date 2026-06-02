@@ -367,17 +367,17 @@ describe('syncAndNotify()', () => {
     expect(count).toBe(1);
   });
 
-  it('最大3件を超えるRSS記事が来ても3件のみ処理する', () => {
+  it('最大5件を超えるRSS記事が来ても5件のみ処理する', () => {
     const articles = Array.from({ length: 15 }, (_, i) => ({
       url: `https://example.com/article${i + 1}`,
       title: `記事${i + 1}`,
     }));
 
     setupXmlServiceMock(articles);
-    setupFetchMocksForArticles(articles.slice(0, 3));
+    setupFetchMocksForArticles(articles.slice(0, 5));
 
     const count = syncAndNotify();
-    expect(count).toBe(3);
+    expect(count).toBe(5);
   });
 
   it('記事ページへのアクセスがHTTPエラー(403等)の場合、要約をスキップしSlack通知しカウントする', () => {
