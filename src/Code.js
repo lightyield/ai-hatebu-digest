@@ -66,7 +66,7 @@ function syncAndNotify() {
     sentUrls = values.map(row => row[0]).filter(url => url);
   }
   
-  // 3. 新着記事の抽出 (最大10件)
+  // 3. 新着記事の抽出 (最大5件)
   let newArticles = [];
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -75,7 +75,7 @@ function syncAndNotify() {
     
     if (!sentUrls.includes(url)) {
       newArticles.push({ url, title });
-      if (newArticles.length >= 3) break;
+      if (newArticles.length >= 5) break;
     }
   }
   
