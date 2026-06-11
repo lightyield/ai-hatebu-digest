@@ -601,8 +601,8 @@ describe('syncAndNotify()', () => {
 
     const count = syncAndNotify();
     expect(count).toBe(2);
-    // 恒常的エラーを検知した時点でサーキットブレーカーが作動するため、Gemini APIの呼び出しは1回のみになるはず
-    expect(geminiCallCount).toBe(1);
+    // 恒常的エラーを検知した時点でサーキットブレーカーが作動するため、最初の記事で4つのフォールバックモデルが試行され、以降の記事では呼び出されない
+    expect(geminiCallCount).toBe(4);
 
     // 2件目の記事は「Gemini APIが一時的に利用不可のため〜」という要約になることを検証
     const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
