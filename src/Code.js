@@ -84,6 +84,8 @@ function syncAndNotify() {
   // 4. 各記事の処理
   let processedCount = 0;
   let geminiServiceUnavailable = false;
+  const MODEL_LIST = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  let activeModelIndex = 0;
   for (let i = 0; i < newArticles.length; i++) {
     const article = newArticles[i];
     
@@ -176,17 +178,20 @@ function syncAndNotify() {
         summary = "Gemini APIが一時的に利用不可のため、要約処理をスキップしました。";
       } else {
         try {
-          const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${props.GEMINI_API_KEY}`;
           const payload = {
             contents: [{
               parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
             }]
           };
           
+          let attempt = 1;
           const maxAttempts = 3;
           let delayMs = 2000;
           
-          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          while (attempt <= maxAttempts) {
+            const currentModel = MODEL_LIST[activeModelIndex];
+            const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${props.GEMINI_API_KEY}`;
+            
             try {
               const geminiRes = UrlFetchApp.fetch(geminiUrl, {
                 method: 'post',
@@ -209,29 +214,48 @@ function syncAndNotify() {
                     break; // ブロックされているためリトライしない
                   }
                 }
-              } else if (responseCode === 503 || responseCode === 429) {
-                console.warn(`Gemini API 一時的エラー (${responseCode}) - リトライ試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
-                if (attempt < maxAttempts) {
-                  Utilities.sleep(delayMs);
-                  delayMs *= 2; // 指数バックオフ
+              } else if (responseCode === 503 || responseCode === 429 || responseCode === 404 || responseCode === 400) {
+                // フォールバックモデルがあれば切り替える
+                if (activeModelIndex < MODEL_LIST.length - 1) {
+                  console.warn(`モデル ${currentModel} でエラー (${responseCode}) が発生したため、フォールバックモデル ${MODEL_LIST[activeModelIndex + 1]} を試行します。理由: `, geminiRes.getContentText());
+                  activeModelIndex++;
+                  continue; // 別のモデルで即座にリトライするため、attemptは増やさずループを継続
+                }
+                
+                // フォールバックがない場合は通常のエラーハンドリング
+                console.warn(`Gemini API エラー (${responseCode}) - リトライ試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
+                if (responseCode === 503 || responseCode === 429) {
+                  if (attempt < maxAttempts) {
+                    Utilities.sleep(delayMs);
+                    delayMs *= 2; // 指数バックオフ
+                    attempt++;
+                  } else {
+                    geminiServiceUnavailable = true;
+                    break;
+                  }
                 } else {
-                  // すべてのリトライが429などで失敗した場合、以降の記事に対するリクエストを抑止する
                   geminiServiceUnavailable = true;
+                  break;
                 }
               } else {
                 console.warn(`Gemini API 恒常的エラー (${responseCode}): `, geminiRes.getContentText());
-                // 400や403等の恒常的エラーはキー無効や権限不足のため、以降の呼び出しを停止する
                 geminiServiceUnavailable = true;
                 break;
               }
             } catch (e) {
+              if (activeModelIndex < MODEL_LIST.length - 1) {
+                console.warn(`モデル ${currentModel} で接続エラーが発生したため、フォールバックモデル ${MODEL_LIST[activeModelIndex + 1]} を試行します。エラー: `, e);
+                activeModelIndex++;
+                continue;
+              }
               console.warn(`Gemini API 接続エラー - リトライ試行 ${attempt}/${maxAttempts}: ` + article.url, e);
               if (attempt < maxAttempts) {
                 Utilities.sleep(delayMs);
                 delayMs *= 2;
+                attempt++;
               } else {
-                // 接続エラーが連続する場合も一時的に利用不可とする
                 geminiServiceUnavailable = true;
+                break;
               }
             }
           }
@@ -463,40 +487,48 @@ function runDiagnostics() {
     // b. Gemini APIテスト
     if (textContent) {
       console.log("Gemini APIへのリクエストを送信します...");
-      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${props.GEMINI_API_KEY}`;
-      const payload = {
-        contents: [{
-          parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
-        }]
-      };
+      const MODEL_LIST = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
       
-      try {
-        const geminiRes = UrlFetchApp.fetch(geminiUrl, {
-          method: 'post',
-          contentType: 'application/json',
-          payload: JSON.stringify(payload),
-          muteHttpExceptions: true
-        });
-        const responseCode = geminiRes.getResponseCode();
-        console.log("Gemini APIレスポンスコード: " + responseCode);
-        const resText = geminiRes.getContentText();
-        console.log("Gemini APIレスポンス本文 (先頭500文字): " + resText.substring(0, 500));
+      for (let m = 0; m < MODEL_LIST.length; m++) {
+        const currentModel = MODEL_LIST[m];
+        console.log(`モデル ${currentModel} でのテスト試行...`);
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${props.GEMINI_API_KEY}`;
+        const payload = {
+          contents: [{
+            parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
+          }]
+        };
         
-        if (responseCode === 200) {
-          const geminiData = JSON.parse(resText);
-          if (geminiData.candidates && geminiData.candidates.length > 0) {
-            const candidate = geminiData.candidates[0];
-            if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
-              console.log("要約成功！内容: " + candidate.content.parts[0].text.substring(0, 150) + "...");
+        try {
+          const geminiRes = UrlFetchApp.fetch(geminiUrl, {
+            method: 'post',
+            contentType: 'application/json',
+            payload: JSON.stringify(payload),
+            muteHttpExceptions: true
+          });
+          const responseCode = geminiRes.getResponseCode();
+          console.log(`  レスポンスコード: ${responseCode}`);
+          const resText = geminiRes.getContentText();
+          
+          if (responseCode === 200) {
+            const geminiData = JSON.parse(resText);
+            if (geminiData.candidates && geminiData.candidates.length > 0) {
+              const candidate = geminiData.candidates[0];
+              if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
+                console.log("  要約成功！内容: " + candidate.content.parts[0].text.substring(0, 150) + "...");
+                break; // 成功したらこの記事のテストは完了
+              } else {
+                console.warn("  警告: content/parts がありません。finishReason: " + candidate.finishReason);
+              }
             } else {
-              console.warn("警告: candidates[0] に content/parts がありません。finishReason: " + candidate.finishReason);
+              console.warn("  警告: candidates が空です。");
             }
           } else {
-            console.warn("警告: candidates が空です。");
+            console.warn(`  エラーレスポンス: ${resText.substring(0, 300)}`);
           }
+        } catch (e) {
+          console.error("  例外発生: ", e);
         }
-      } catch (e) {
-        console.error("Gemini APIリクエスト中に例外が発生しました: ", e);
       }
     } else {
       console.log("本文がないため Gemini API テストはスキップします。");
