@@ -83,6 +83,7 @@ function syncAndNotify() {
   
   // 4. 各記事の処理
   let processedCount = 0;
+  let geminiServiceUnavailable = false;
   for (let i = 0; i < newArticles.length; i++) {
     const article = newArticles[i];
     
@@ -115,10 +116,11 @@ function syncAndNotify() {
         console.warn("スクレイピング失敗: " + article.url, e);
       }
       
-      // テキストが取れなかった場合もスキップ扱い
-      if (!scrapeSkipped && !textContent) {
+      // テキストが取れなかった、または極端に短い場合もスキップ扱い
+      const MIN_TEXT_LENGTH = 150;
+      if (!scrapeSkipped && (!textContent || textContent.length < MIN_TEXT_LENGTH)) {
         scrapeSkipped = true;
-        scrapeSkipReason = "記事本文のテキストを抽出できませんでした。複数ページ構成や動的コンテンツの可能性があります。";
+        scrapeSkipReason = `記事本文のテキストを十分に抽出できませんでした（取得文字数: ${textContent ? textContent.length : 0}文字）。SPA（JavaScriptによる動的描画のサイト）や、Cloudflareなどのボット防御によってコンテンツ取得が遮断された可能性があります。`;
       }
       
       // スキップ時: Slack通知してスプレッドシートに保存し次の記事へ
@@ -170,53 +172,72 @@ function syncAndNotify() {
       
       // b. Gemini APIによる要約
       let summary = "要約を取得できませんでした。";
-      try {
-        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${props.GEMINI_API_KEY}`;
-        const payload = {
-          contents: [{
-            parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
-          }]
-        };
-        
-        const maxAttempts = 3;
-        let delayMs = 2000;
-        
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          try {
-            const geminiRes = UrlFetchApp.fetch(geminiUrl, {
-              method: 'post',
-              contentType: 'application/json',
-              payload: JSON.stringify(payload),
-              muteHttpExceptions: true
-            });
-            
-            const responseCode = geminiRes.getResponseCode();
-            if (responseCode === 200) {
-              const geminiData = JSON.parse(geminiRes.getContentText());
-              if (geminiData.candidates && geminiData.candidates.length > 0) {
-                summary = geminiData.candidates[0].content.parts[0].text;
+      if (geminiServiceUnavailable) {
+        summary = "Gemini APIが一時的に利用不可のため、要約処理をスキップしました。";
+      } else {
+        try {
+          const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${props.GEMINI_API_KEY}`;
+          const payload = {
+            contents: [{
+              parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
+            }]
+          };
+          
+          const maxAttempts = 3;
+          let delayMs = 2000;
+          
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              const geminiRes = UrlFetchApp.fetch(geminiUrl, {
+                method: 'post',
+                contentType: 'application/json',
+                payload: JSON.stringify(payload),
+                muteHttpExceptions: true
+              });
+              
+              const responseCode = geminiRes.getResponseCode();
+              if (responseCode === 200) {
+                const geminiData = JSON.parse(geminiRes.getContentText());
+                if (geminiData.candidates && geminiData.candidates.length > 0) {
+                  const candidate = geminiData.candidates[0];
+                  if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
+                    summary = candidate.content.parts[0].text;
+                    break;
+                  } else if (candidate.finishReason) {
+                    summary = `要約を取得できませんでした (理由: ${candidate.finishReason})`;
+                    console.warn(`Gemini API 判定ブロック: ${candidate.finishReason} - URL: ${article.url}`);
+                    break; // ブロックされているためリトライしない
+                  }
+                }
+              } else if (responseCode === 503 || responseCode === 429) {
+                console.warn(`Gemini API 一時的エラー (${responseCode}) - リトライ試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
+                if (attempt < maxAttempts) {
+                  Utilities.sleep(delayMs);
+                  delayMs *= 2; // 指数バックオフ
+                } else {
+                  // すべてのリトライが429などで失敗した場合、以降の記事に対するリクエストを抑止する
+                  geminiServiceUnavailable = true;
+                }
+              } else {
+                console.warn(`Gemini API 恒常的エラー (${responseCode}): `, geminiRes.getContentText());
+                // 400や403等の恒常的エラーはキー無効や権限不足のため、以降の呼び出しを停止する
+                geminiServiceUnavailable = true;
                 break;
               }
-            } else if (responseCode === 503 || responseCode === 429) {
-              console.warn(`Gemini API 一時的エラー (${responseCode}) - リトライ試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
+            } catch (e) {
+              console.warn(`Gemini API 接続エラー - リトライ試行 ${attempt}/${maxAttempts}: ` + article.url, e);
               if (attempt < maxAttempts) {
                 Utilities.sleep(delayMs);
-                delayMs *= 2; // 指数バックオフ
+                delayMs *= 2;
+              } else {
+                // 接続エラーが連続する場合も一時的に利用不可とする
+                geminiServiceUnavailable = true;
               }
-            } else {
-              console.warn(`Gemini API エラー (${responseCode}): `, geminiRes.getContentText());
-              break; // 400等の致命的/恒常的エラーはリトライしない
-            }
-          } catch (e) {
-            console.warn(`Gemini API 接続エラー - リトライ試行 ${attempt}/${maxAttempts}: ` + article.url, e);
-            if (attempt < maxAttempts) {
-              Utilities.sleep(delayMs);
-              delayMs *= 2;
             }
           }
+        } catch (e) {
+          console.warn("Gemini API要約処理プロセス全体で例外が発生しました: " + article.url, e);
         }
-      } catch (e) {
-        console.warn("Gemini API要約処理プロセス全体で例外が発生しました: " + article.url, e);
       }
       
       // c. はてなブックマーク JSONLite API でブコメ取得
@@ -365,9 +386,130 @@ function testSlackNotification() {
   console.log("Slack にテスト通知を送信しました。");
 }
 
+function runDiagnostics() {
+  const props = getProperties();
+  console.log("=== GAS環境情報の診断 ===");
+  console.log("SLACK_WEBHOOK_URL: " + (props.SLACK_WEBHOOK_URL ? "設定あり" : "未設定"));
+  console.log("GEMINI_API_KEY: " + (props.GEMINI_API_KEY ? "設定あり (長さ: " + props.GEMINI_API_KEY.length + ")" : "未設定"));
+  console.log("HATENA_RSS_URL: " + props.HATENA_RSS_URL);
+  
+  if (!props.GEMINI_API_KEY) {
+    console.error("GEMINI_API_KEY が設定されていません。スクリプトプロパティを確認してください。");
+    return;
+  }
+  
+  console.log("\n=== 1. RSSフィードの取得テスト ===");
+  let items = [];
+  try {
+    const rssRes = UrlFetchApp.fetch(props.HATENA_RSS_URL);
+    console.log("RSS取得ステータス: " + rssRes.getResponseCode());
+    const xml = rssRes.getContentText();
+    const document = XmlService.parse(xml);
+    const root = document.getRootElement();
+    const ns = XmlService.getNamespace('http://purl.org/rss/1.0/');
+    items = root.getChildren('item', ns);
+    console.log("RSS内の記事数: " + items.length + " 件");
+  } catch (e) {
+    console.error("RSSの取得または解析に失敗しました: ", e);
+    return;
+  }
+  
+  if (items.length === 0) {
+    console.warn("RSS内の記事が見つかりませんでした。");
+    return;
+  }
+  
+  console.log("\n=== 2. 記事の取得・スクレイピング・Gemini APIテスト (先頭3件) ===");
+  const testCount = Math.min(items.length, 3);
+  const ns = XmlService.getNamespace('http://purl.org/rss/1.0/');
+  
+  for (let i = 0; i < testCount; i++) {
+    const item = items[i];
+    const url = item.getChild('link', ns).getText();
+    const title = item.getChild('title', ns).getText();
+    console.log(`\n--- テスト記事 [${i+1}] ---`);
+    console.log("タイトル: " + title);
+    console.log("URL: " + url);
+    
+    // a. スクレイピングテスト
+    let textContent = "";
+    try {
+      const pageRes = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+      const responseCode = pageRes.getResponseCode();
+      console.log("HTTPステータスコード: " + responseCode);
+      if (responseCode === 200) {
+        let html = pageRes.getContentText();
+        console.log("元HTML文字数: " + html.length + "文字");
+        
+        // クレンジング処理
+        html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ');
+        html = html.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ');
+        html = html.replace(/<[^>]+>/g, ' ');
+        html = html.replace(/\s+/g, ' ').trim();
+        textContent = html.substring(0, 8000);
+        console.log("クレンジング後文字数: " + textContent.length + "文字");
+        if (textContent.length > 0) {
+          console.log("テキストサンプル: " + textContent.substring(0, 150) + "...");
+        } else {
+          console.warn("警告: クレンジング後のテキストが空です。");
+        }
+      } else {
+        console.warn(`警告: HTTP ${responseCode} のためスクレイピングはスキップ対象になります。`);
+      }
+    } catch (e) {
+      console.error("スクレイピング中に例外が発生しました: ", e);
+    }
+    
+    // b. Gemini APIテスト
+    if (textContent) {
+      console.log("Gemini APIへのリクエストを送信します...");
+      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${props.GEMINI_API_KEY}`;
+      const payload = {
+        contents: [{
+          parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
+        }]
+      };
+      
+      try {
+        const geminiRes = UrlFetchApp.fetch(geminiUrl, {
+          method: 'post',
+          contentType: 'application/json',
+          payload: JSON.stringify(payload),
+          muteHttpExceptions: true
+        });
+        const responseCode = geminiRes.getResponseCode();
+        console.log("Gemini APIレスポンスコード: " + responseCode);
+        const resText = geminiRes.getContentText();
+        console.log("Gemini APIレスポンス本文 (先頭500文字): " + resText.substring(0, 500));
+        
+        if (responseCode === 200) {
+          const geminiData = JSON.parse(resText);
+          if (geminiData.candidates && geminiData.candidates.length > 0) {
+            const candidate = geminiData.candidates[0];
+            if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
+              console.log("要約成功！内容: " + candidate.content.parts[0].text.substring(0, 150) + "...");
+            } else {
+              console.warn("警告: candidates[0] に content/parts がありません。finishReason: " + candidate.finishReason);
+            }
+          } else {
+            console.warn("警告: candidates が空です。");
+          }
+        }
+      } catch (e) {
+        console.error("Gemini APIリクエスト中に例外が発生しました: ", e);
+      }
+    } else {
+      console.log("本文がないため Gemini API テストはスキップします。");
+    }
+    
+    Utilities.sleep(1000); // テスト間のウェイト
+  }
+  console.log("\n=== 診断終了 ===");
+}
+
 // ----------------------------------------------------
 // Jest テスト用エクスポート (GAS本番環境では無視される)
 // ----------------------------------------------------
 if (typeof module !== 'undefined') {
-  module.exports = { getProperties, doGet, checkToken, runCron, syncAndNotify };
+  module.exports = { getProperties, doGet, checkToken, runCron, syncAndNotify, runDiagnostics };
 }

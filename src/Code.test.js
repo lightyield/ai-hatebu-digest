@@ -337,7 +337,7 @@ describe('syncAndNotify()', () => {
       }
       if (url === articles[0].url) {
         return {
-          getContentText: jest.fn(() => '<html><body>記事本文</body></html>'),
+          getContentText: jest.fn(() => '<html><body>' + '記事本文。'.repeat(50) + '</body></html>'),
           getResponseCode: jest.fn(() => 200),
         };
       }
@@ -473,6 +473,143 @@ describe('syncAndNotify()', () => {
     // insertRowBefore は2回とも呼ばれるはず
     expect(mockSheet.insertRowBefore).toHaveBeenCalledTimes(2);
   });
+
+  it('本文テキストが極端に短い（150文字未満）の場合、要約をスキップしSlack警告通知を送る', () => {
+    const articles = [
+      { url: 'https://example.com/short', title: '短い記事' },
+    ];
+    setupXmlServiceMock(articles);
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>短いテキスト。</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(1);
+    
+    // Slack Webhook に警告メッセージ（要約スキップ）が送信されたことを検証
+    const slackCall = global.UrlFetchApp.fetch.mock.calls.find(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCall).toBeDefined();
+    const payload = JSON.parse(slackCall[1].payload);
+    expect(payload.blocks[3].text.text).toContain('要約スキップ');
+    expect(payload.blocks[3].text.text).toContain('テキストを十分に抽出できませんでした');
+  });
+
+  it('Gemini APIが安全フィルター（SAFETY等）でブロックされた場合、リトライせずにエラー理由を表示する', () => {
+    const articles = [
+      { url: 'https://example.com/blocked', title: 'ブロック記事' },
+    ];
+    setupXmlServiceMock(articles);
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('generativelanguage')) {
+        // contentが欠落し、finishReason が SAFETY であるレスポンス
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            candidates: [{ finishReason: 'SAFETY' }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(1);
+
+    // Slack への送信内容に安全フィルターに関する理由が含まれることを検証
+    const slackCall = global.UrlFetchApp.fetch.mock.calls.find(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCall).toBeDefined();
+    const payload = JSON.parse(slackCall[1].payload);
+    expect(payload.blocks[3].text.text).toContain('理由: SAFETY');
+  });
+
+  it('Gemini APIが恒常的なエラー（400等）を返した場合、サーキットブレーカー（利用停止フラグ）が作動し以降の記事のAPI呼び出しをスキップする', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+      { url: 'https://example.com/article2', title: '記事2' },
+    ];
+    setupXmlServiceMock(articles);
+
+    let geminiCallCount = 0;
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url || url === articles[1].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('generativelanguage')) {
+        geminiCallCount++;
+        // 恒常的エラー 400 Bad Request
+        return {
+          getContentText: jest.fn(() => '{"error":"bad request"}'),
+          getResponseCode: jest.fn(() => 400),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(2);
+    // 恒常的エラーを検知した時点でサーキットブレーカーが作動するため、Gemini APIの呼び出しは1回のみになるはず
+    expect(geminiCallCount).toBe(1);
+
+    // 2件目の記事は「Gemini APIが一時的に利用不可のため〜」という要約になることを検証
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(2);
+    const payload2 = JSON.parse(slackCalls[1][1].payload);
+    expect(payload2.blocks[3].text.text).toContain('Gemini APIが一時的に利用不可');
+  });
 });
 
 // ============================================================
@@ -533,7 +670,7 @@ function setupFetchMocksForArticles(articles) {
     }
     // Slack Webhook & 記事本文スクレイピング
     return {
-      getContentText: jest.fn(() => '<html><body>記事本文テキスト</body></html>'),
+      getContentText: jest.fn(() => '<html><body>' + '記事本文テキスト。'.repeat(30) + '</body></html>'),
       getResponseCode: jest.fn(() => 200),
     };
   });
