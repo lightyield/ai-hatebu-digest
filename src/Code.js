@@ -41,6 +41,88 @@ function runCron() {
   }
 }
 
+/**
+ * 利用可能なGeminiモデル一覧を動的に取得し、要約に適したFlash系モデルを優先順にソートして返却する
+ * @param {string} apiKey - Gemini APIキー
+ * @returns {string[]} 利用可能なモデル名（ID）のリスト
+ */
+function getAvailableGeminiModels(apiKey) {
+  const DEFAULT_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+  if (!apiKey) return DEFAULT_MODELS;
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+    const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    
+    if (response.getResponseCode() !== 200) {
+      console.warn(`Geminiモデル一覧取得失敗 (HTTP ${response.getResponseCode()}): `, response.getContentText());
+      return DEFAULT_MODELS;
+    }
+
+    const data = JSON.parse(response.getContentText());
+    if (!data.models || !Array.isArray(data.models)) {
+      return DEFAULT_MODELS;
+    }
+
+    // 1. generateContent をサポートしているモデルを抽出
+    const candidates = data.models.filter(m => {
+      if (!m.name) return false;
+      const methods = m.supportedGenerationMethods || [];
+      return methods.includes('generateContent');
+    }).map(m => m.name.replace(/^models\//, ''));
+
+    // 2. 特殊用途モデル（画像生成、TTS、ネイティブオーディオプレビューなど）を除外
+    const validModels = candidates.filter(name => {
+      const lower = name.toLowerCase();
+      if (lower.includes('image') || lower.includes('tts') || lower.includes('audio') || lower.includes('realtime') || lower.includes('embedding')) {
+        return false;
+      }
+      return true;
+    });
+
+    // 3. Flash系モデルを優先し、バージョン降順でソート
+    const flashModels = validModels.filter(m => m.toLowerCase().includes('flash'));
+    const otherModels = validModels.filter(m => !m.toLowerCase().includes('flash') && m.toLowerCase().startsWith('gemini-'));
+
+    const sortFn = (a, b) => {
+      // プレビュー・実験用より安定版を優先
+      const isPreviewA = a.includes('preview') || a.includes('exp');
+      const isPreviewB = b.includes('preview') || b.includes('exp');
+      if (isPreviewA !== isPreviewB) {
+        return isPreviewA ? 1 : -1;
+      }
+      // バージョン番号の抽出比較 (例: gemini-2.5-flash -> 2.5)
+      const vA = (a.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || '0';
+      const vB = (b.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || '0';
+      const numA = parseFloat(vA);
+      const numB = parseFloat(vB);
+      if (numA !== numB) {
+        return numB - numA; // 降順
+      }
+      // -lite は標準版の後に配置
+      const isLiteA = a.includes('lite');
+      const isLiteB = b.includes('lite');
+      if (isLiteA !== isLiteB) {
+        return isLiteA ? 1 : -1;
+      }
+      return a.localeCompare(b);
+    };
+
+    flashModels.sort(sortFn);
+    otherModels.sort(sortFn);
+
+    const result = [...flashModels, ...otherModels];
+    if (result.length > 0) {
+      return result;
+    }
+
+    return DEFAULT_MODELS;
+  } catch (e) {
+    console.warn("Geminiモデル一覧取得中に例外が発生しました: ", e);
+    return DEFAULT_MODELS;
+  }
+}
+
 function syncAndNotify() {
   const props = getProperties();
   const rssUrl = props.HATENA_RSS_URL;
@@ -81,11 +163,12 @@ function syncAndNotify() {
   
   if (newArticles.length === 0) return 0; // 新着記事なし
   
-  // 4. 各記事の処理
-  let processedCount = 0;
+  // 4. 動的モデル一覧の取得
+  const MODEL_LIST = getAvailableGeminiModels(props.GEMINI_API_KEY);
   let geminiServiceUnavailable = false;
-  const MODEL_LIST = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
-  let activeModelIndex = 0;
+
+  // 5. 各記事の処理
+  let processedCount = 0;
   for (let i = 0; i < newArticles.length; i++) {
     const article = newArticles[i];
     
@@ -184,80 +267,84 @@ function syncAndNotify() {
             }]
           };
           
-          let attempt = 1;
-          const maxAttempts = 3;
-          let delayMs = 2000;
-          
-          while (attempt <= maxAttempts) {
-            const currentModel = MODEL_LIST[activeModelIndex];
-            const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${props.GEMINI_API_KEY}`;
-            
-            try {
-              const geminiRes = UrlFetchApp.fetch(geminiUrl, {
-                method: 'post',
-                contentType: 'application/json',
-                payload: JSON.stringify(payload),
-                muteHttpExceptions: true
-              });
-              
-              const responseCode = geminiRes.getResponseCode();
-              if (responseCode === 200) {
-                const geminiData = JSON.parse(geminiRes.getContentText());
-                if (geminiData.candidates && geminiData.candidates.length > 0) {
-                  const candidate = geminiData.candidates[0];
-                  if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
-                    summary = candidate.content.parts[0].text;
-                    break;
-                  } else if (candidate.finishReason) {
-                    summary = `要約を取得できませんでした (理由: ${candidate.finishReason})`;
-                    console.warn(`Gemini API 判定ブロック: ${candidate.finishReason} - URL: ${article.url}`);
-                    break; // ブロックされているためリトライしない
+          let succeeded = false;
+          for (let m = 0; m < MODEL_LIST.length; m++) {
+            const currentModel = MODEL_LIST[m];
+            let attempt = 1;
+            const maxAttempts = 2;
+            let delayMs = 1500;
+            let shouldFallback = false;
+
+            while (attempt <= maxAttempts) {
+              const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${props.GEMINI_API_KEY}`;
+              try {
+                const geminiRes = UrlFetchApp.fetch(geminiUrl, {
+                  method: 'post',
+                  contentType: 'application/json',
+                  payload: JSON.stringify(payload),
+                  muteHttpExceptions: true
+                });
+
+                const responseCode = geminiRes.getResponseCode();
+                if (responseCode === 200) {
+                  const geminiData = JSON.parse(geminiRes.getContentText());
+                  if (geminiData.candidates && geminiData.candidates.length > 0) {
+                    const candidate = geminiData.candidates[0];
+                    if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
+                      summary = candidate.content.parts[0].text;
+                      succeeded = true;
+                      break;
+                    } else if (candidate.finishReason) {
+                      summary = `要約を取得できませんでした (理由: ${candidate.finishReason})`;
+                      console.warn(`Gemini API 判定ブロック: ${candidate.finishReason} - URL: ${article.url}`);
+                      succeeded = true; // ブロックはモデルの判定結果のためリトライ・フォールバック不要
+                      break;
+                    }
                   }
-                }
-              } else if (responseCode === 503 || responseCode === 429 || responseCode === 404 || responseCode === 400) {
-                // フォールバックモデルがあれば切り替える
-                if (activeModelIndex < MODEL_LIST.length - 1) {
-                  console.warn(`モデル ${currentModel} でエラー (${responseCode}) が発生したため、フォールバックモデル ${MODEL_LIST[activeModelIndex + 1]} を試行します。理由: `, geminiRes.getContentText());
-                  activeModelIndex++;
-                  continue; // 別のモデルで即座にリトライするため、attemptは増やさずループを継続
-                }
-                
-                // フォールバックがない場合は通常のエラーハンドリング
-                console.warn(`Gemini API エラー (${responseCode}) - リトライ試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
-                if (responseCode === 503 || responseCode === 429) {
+                } else if (responseCode === 429 || responseCode === 503) {
+                  console.warn(`モデル ${currentModel} で一時的エラー (${responseCode}) - 試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
                   if (attempt < maxAttempts) {
                     Utilities.sleep(delayMs);
-                    delayMs *= 2; // 指数バックオフ
+                    delayMs *= 2;
                     attempt++;
                   } else {
-                    geminiServiceUnavailable = true;
+                    shouldFallback = true;
                     break;
                   }
+                } else if (responseCode === 404 || responseCode === 400) {
+                  console.warn(`モデル ${currentModel} でエラー (${responseCode}): `, geminiRes.getContentText());
+                  shouldFallback = true;
+                  break;
                 } else {
+                  console.warn(`Gemini API 恒常的エラー (${responseCode}): `, geminiRes.getContentText());
                   geminiServiceUnavailable = true;
                   break;
                 }
-              } else {
-                console.warn(`Gemini API 恒常的エラー (${responseCode}): `, geminiRes.getContentText());
-                geminiServiceUnavailable = true;
-                break;
-              }
-            } catch (e) {
-              if (activeModelIndex < MODEL_LIST.length - 1) {
-                console.warn(`モデル ${currentModel} で接続エラーが発生したため、フォールバックモデル ${MODEL_LIST[activeModelIndex + 1]} を試行します。エラー: `, e);
-                activeModelIndex++;
-                continue;
-              }
-              console.warn(`Gemini API 接続エラー - リトライ試行 ${attempt}/${maxAttempts}: ` + article.url, e);
-              if (attempt < maxAttempts) {
-                Utilities.sleep(delayMs);
-                delayMs *= 2;
-                attempt++;
-              } else {
-                geminiServiceUnavailable = true;
-                break;
+              } catch (e) {
+                console.warn(`モデル ${currentModel} 接続エラー - 試行 ${attempt}/${maxAttempts}: ` + article.url, e);
+                if (attempt < maxAttempts) {
+                  Utilities.sleep(delayMs);
+                  delayMs *= 2;
+                  attempt++;
+                } else {
+                  shouldFallback = true;
+                  break;
+                }
               }
             }
+
+            if (succeeded || geminiServiceUnavailable) {
+              break;
+            }
+
+            if (shouldFallback && m < MODEL_LIST.length - 1) {
+              console.warn(`モデル ${currentModel} から次候補モデル ${MODEL_LIST[m + 1]} へフォールバックします。`);
+            }
+          }
+
+          if (!succeeded && !geminiServiceUnavailable) {
+            console.warn("すべてのGeminiモデル候補で要約生成に失敗しました。以降の記事のAPI呼び出しを一時停止します。");
+            geminiServiceUnavailable = true;
           }
         } catch (e) {
           console.warn("Gemini API要約処理プロセス全体で例外が発生しました: " + article.url, e);
@@ -442,8 +529,12 @@ function runDiagnostics() {
     console.warn("RSS内の記事が見つかりませんでした。");
     return;
   }
+
+  console.log("\n=== 2. Gemini 利用可能モデルの動的取得テスト ===");
+  const availableModels = getAvailableGeminiModels(props.GEMINI_API_KEY);
+  console.log("利用可能モデル候補: ", JSON.stringify(availableModels));
   
-  console.log("\n=== 2. 記事の取得・スクレイピング・Gemini APIテスト (先頭3件) ===");
+  console.log("\n=== 3. 記事の取得・スクレイピング・Gemini APIテスト (先頭3件) ===");
   const testCount = Math.min(items.length, 3);
   const ns = XmlService.getNamespace('http://purl.org/rss/1.0/');
   
@@ -487,10 +578,9 @@ function runDiagnostics() {
     // b. Gemini APIテスト
     if (textContent) {
       console.log("Gemini APIへのリクエストを送信します...");
-      const MODEL_LIST = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
       
-      for (let m = 0; m < MODEL_LIST.length; m++) {
-        const currentModel = MODEL_LIST[m];
+      for (let m = 0; m < availableModels.length; m++) {
+        const currentModel = availableModels[m];
         console.log(`モデル ${currentModel} でのテスト試行...`);
         const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${props.GEMINI_API_KEY}`;
         const payload = {
@@ -543,5 +633,6 @@ function runDiagnostics() {
 // Jest テスト用エクスポート (GAS本番環境では無視される)
 // ----------------------------------------------------
 if (typeof module !== 'undefined') {
-  module.exports = { getProperties, doGet, checkToken, runCron, syncAndNotify, runDiagnostics };
+  module.exports = { getProperties, doGet, checkToken, runCron, getAvailableGeminiModels, syncAndNotify, runDiagnostics };
 }
+
