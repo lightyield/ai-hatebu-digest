@@ -75,6 +75,7 @@ const {
   checkToken,
   doGet,
   runCron,
+  getAvailableGeminiModels,
   syncAndNotify,
 } = require('./Code');
 
@@ -228,6 +229,64 @@ describe('runCron()', () => {
 });
 
 // ------------------------------------------------------------
+// getAvailableGeminiModels
+// ------------------------------------------------------------
+describe('getAvailableGeminiModels()', () => {
+  it('APIキーが未指定の場合、デフォルトモデルリストを返す', () => {
+    const models = getAvailableGeminiModels('');
+    expect(models).toEqual(['gemini-2.5-flash', 'gemini-2.5-flash-lite']);
+  });
+
+  it('models.list APIから正常にモデル一覧を取得し、適切にフィルタ・ソートする', () => {
+    const mockApiResponse = {
+      models: [
+        { name: 'models/gemini-1.5-pro', supportedGenerationMethods: ['generateContent'] },
+        { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+        { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
+        { name: 'models/gemini-3.5-flash', supportedGenerationMethods: ['generateContent'] },
+        { name: 'models/gemini-2.5-flash-image', supportedGenerationMethods: ['generateContent'] }, // 画像用除外
+        { name: 'models/text-embedding-004', supportedGenerationMethods: ['embedContent'] }, // 非generateContent
+        { name: 'models/gemini-2.5-flash-preview', supportedGenerationMethods: ['generateContent'] }, // プレビュー版
+      ],
+    };
+
+    global.UrlFetchApp.fetch.mockReturnValue({
+      getContentText: jest.fn(() => JSON.stringify(mockApiResponse)),
+      getResponseCode: jest.fn(() => 200),
+    });
+
+    const result = getAvailableGeminiModels('test-key');
+
+    // 安定版 Flash がバージョン降順で優先され、プレビュー版は後、非Flashはさらに後になる
+    expect(result[0]).toBe('gemini-3.5-flash');
+    expect(result[1]).toBe('gemini-2.5-flash');
+    expect(result[2]).toBe('gemini-2.5-flash-lite');
+    expect(result).toContain('gemini-1.5-pro');
+    expect(result).not.toContain('gemini-2.5-flash-image');
+    expect(result).not.toContain('text-embedding-004');
+  });
+
+  it('models.list APIがHTTPエラーを返した場合、デフォルトモデルリストを返す', () => {
+    global.UrlFetchApp.fetch.mockReturnValue({
+      getContentText: jest.fn(() => 'Internal Server Error'),
+      getResponseCode: jest.fn(() => 500),
+    });
+
+    const result = getAvailableGeminiModels('test-key');
+    expect(result).toEqual(['gemini-2.5-flash', 'gemini-2.5-flash-lite']);
+  });
+
+  it('models.list API呼び出しで例外が発生した場合、デフォルトモデルリストを返す', () => {
+    global.UrlFetchApp.fetch.mockImplementation(() => {
+      throw new Error('Network error');
+    });
+
+    const result = getAvailableGeminiModels('test-key');
+    expect(result).toEqual(['gemini-2.5-flash', 'gemini-2.5-flash-lite']);
+  });
+});
+
+// ------------------------------------------------------------
 // syncAndNotify
 // ------------------------------------------------------------
 describe('syncAndNotify()', () => {
@@ -335,13 +394,22 @@ describe('syncAndNotify()', () => {
           getResponseCode: jest.fn(() => 200),
         };
       }
+      if (url.includes('models?key=')) {
+        // models.list
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [{ name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
       if (url === articles[0].url) {
         return {
           getContentText: jest.fn(() => '<html><body>' + '記事本文。'.repeat(50) + '</body></html>'),
           getResponseCode: jest.fn(() => 200),
         };
       }
-      if (url.includes('generativelanguage')) {
+      if (url.includes(':generateContent')) {
         // Gemini API 失敗
         return {
           getContentText: jest.fn(() => '{"error":"quota exceeded"}'),
@@ -527,7 +595,15 @@ describe('syncAndNotify()', () => {
           getResponseCode: jest.fn(() => 200),
         };
       }
-      if (url.includes('generativelanguage')) {
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [{ name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
         // contentが欠落し、finishReason が SAFETY であるレスポンス
         return {
           getContentText: jest.fn(() => JSON.stringify({
@@ -558,7 +634,78 @@ describe('syncAndNotify()', () => {
     expect(payload.blocks[3].text.text).toContain('理由: SAFETY');
   });
 
-  it('Gemini APIが恒常的なエラー（400等）を返した場合、サーキットブレーカー（利用停止フラグ）が作動し以降の記事のAPI呼び出しをスキップする', () => {
+  it('Gemini APIがモデルエラー（404等）を返した場合、次候補モデルにフォールバックして要約を生成する', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+    ];
+    setupXmlServiceMock(articles);
+
+    let triedModels = [];
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [
+              { name: 'models/gemini-3.5-flash', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
+            ]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        if (url.includes('gemini-3.5-flash')) {
+          triedModels.push('gemini-3.5-flash');
+          return {
+            getContentText: jest.fn(() => '{"error":"model not found"}'),
+            getResponseCode: jest.fn(() => 404),
+          };
+        }
+        if (url.includes('gemini-2.5-flash')) {
+          triedModels.push('gemini-2.5-flash');
+          return {
+            getContentText: jest.fn(() => JSON.stringify({
+              candidates: [{ content: { parts: [{ text: 'フォールバック成功要約' }] } }]
+            })),
+            getResponseCode: jest.fn(() => 200),
+          };
+        }
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(1);
+    expect(triedModels).toEqual(['gemini-3.5-flash', 'gemini-2.5-flash']);
+
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(1);
+    const payload = JSON.parse(slackCalls[0][1].payload);
+    expect(payload.blocks[3].text.text).toContain('フォールバック成功要約');
+  });
+
+  it('すべてのGeminiモデルでエラーとなった場合、サーキットブレーカーが作動し以降の記事をスキップする', () => {
     const articles = [
       { url: 'https://example.com/article1', title: '記事1' },
       { url: 'https://example.com/article2', title: '記事2' },
@@ -573,13 +720,24 @@ describe('syncAndNotify()', () => {
           getResponseCode: jest.fn(() => 200),
         };
       }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [
+              { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+            ]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
       if (url === articles[0].url || url === articles[1].url) {
         return {
           getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
           getResponseCode: jest.fn(() => 200),
         };
       }
-      if (url.includes('generativelanguage')) {
+      if (url.includes(':generateContent')) {
         geminiCallCount++;
         // 恒常的エラー 400 Bad Request
         return {
@@ -601,8 +759,8 @@ describe('syncAndNotify()', () => {
 
     const count = syncAndNotify();
     expect(count).toBe(2);
-    // 恒常的エラーを検知した時点でサーキットブレーカーが作動するため、最初の記事で4つのフォールバックモデルが試行され、以降の記事では呼び出されない
-    expect(geminiCallCount).toBe(4);
+    // 最初の記事で2つのモデルが試行され、すべて失敗したためサーキットブレーカー作動。2つ目の記事ではgenerateContentは呼ばれない
+    expect(geminiCallCount).toBe(2);
 
     // 2件目の記事は「Gemini APIが一時的に利用不可のため〜」という要約になることを検証
     const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
@@ -640,6 +798,18 @@ function setupFetchMocksForArticles(articles) {
     if (url === mockProps.HATENA_RSS_URL) {
       return {
         getContentText: jest.fn(() => buildRssXml(articles)),
+        getResponseCode: jest.fn(() => 200),
+      };
+    }
+    // models.list
+    if (url.includes('models?key=')) {
+      return {
+        getContentText: jest.fn(() => JSON.stringify({
+          models: [
+            { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
+            { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+          ]
+        })),
         getResponseCode: jest.fn(() => 200),
       };
     }
@@ -683,3 +853,4 @@ function setupFetchMocksForArticles(articles) {
 function buildRssXml(articles) {
   return `<?xml version="1.0"?><rdf:RDF></rdf:RDF>`;
 }
+
