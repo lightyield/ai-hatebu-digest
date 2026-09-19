@@ -48,6 +48,7 @@ function runCron() {
  */
 function getAvailableGeminiModels(apiKey) {
   const DEFAULT_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+  const MAX_CANDIDATE_MODELS = 3;
   if (!apiKey) return DEFAULT_MODELS;
 
   try {
@@ -113,7 +114,7 @@ function getAvailableGeminiModels(apiKey) {
 
     const result = [...flashModels, ...otherModels];
     if (result.length > 0) {
-      return result;
+      return result.slice(0, MAX_CANDIDATE_MODELS);
     }
 
     return DEFAULT_MODELS;
@@ -124,6 +125,8 @@ function getAvailableGeminiModels(apiKey) {
 }
 
 function syncAndNotify() {
+  const startTime = Date.now();
+  const MAX_EXECUTION_TIME_MS = 240 * 1000; // 4分（GAS最大実行時間6分に対する安全マージン）
   const props = getProperties();
   const rssUrl = props.HATENA_RSS_URL;
   
@@ -163,13 +166,19 @@ function syncAndNotify() {
   
   if (newArticles.length === 0) return 0; // 新着記事なし
   
-  // 4. 動的モデル一覧の取得
+  // 4. 動的モデル一覧の取得 (上位最大3件)
   const MODEL_LIST = getAvailableGeminiModels(props.GEMINI_API_KEY);
   let geminiServiceUnavailable = false;
 
   // 5. 各記事の処理
   let processedCount = 0;
   for (let i = 0; i < newArticles.length; i++) {
+    // 実行時間の安全監視: 4分を超過している場合は残りの記事を次回に回して正常終了
+    if (Date.now() - startTime > MAX_EXECUTION_TIME_MS) {
+      console.warn(`GAS実行制限時間（4分）に達したため、残りの記事の処理を安全に終了します（処理済: ${processedCount}件）。`);
+      break;
+    }
+
     const article = newArticles[i];
     
     try {
@@ -301,7 +310,13 @@ function syncAndNotify() {
                       break;
                     }
                   }
-                } else if (responseCode === 429 || responseCode === 503) {
+                } else if (responseCode === 429) {
+                  // レートリミット（無料枠制限 / Quota Exceeded）
+                  console.warn(`Gemini API レートリミット超過 (${responseCode}): `, geminiRes.getContentText());
+                  geminiServiceUnavailable = true; // モデルを変えても同じAPIキー全体で制限されるため即座にサーキットブレーカー発動
+                  break;
+                } else if (responseCode === 503) {
+                  // 一時的過負荷: リトライし、ダメならフォールバック
                   console.warn(`モデル ${currentModel} で一時的エラー (${responseCode}) - 試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
                   if (attempt < maxAttempts) {
                     Utilities.sleep(delayMs);
@@ -311,9 +326,15 @@ function syncAndNotify() {
                     shouldFallback = true;
                     break;
                   }
-                } else if (responseCode === 404 || responseCode === 400) {
-                  console.warn(`モデル ${currentModel} でエラー (${responseCode}): `, geminiRes.getContentText());
+                } else if (responseCode === 404) {
+                  // モデルが存在しない / 廃止された: 次のモデルへフォールバック
+                  console.warn(`モデル ${currentModel} が見つかりません (${responseCode}): `, geminiRes.getContentText());
                   shouldFallback = true;
+                  break;
+                } else if (responseCode === 400) {
+                  // 不正なリクエスト / APIキー不正等
+                  console.warn(`Gemini API リクエストエラー (${responseCode}): `, geminiRes.getContentText());
+                  geminiServiceUnavailable = true;
                   break;
                 } else {
                   console.warn(`Gemini API 恒常的エラー (${responseCode}): `, geminiRes.getContentText());

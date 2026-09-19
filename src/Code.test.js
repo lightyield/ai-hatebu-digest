@@ -237,7 +237,7 @@ describe('getAvailableGeminiModels()', () => {
     expect(models).toEqual(['gemini-2.5-flash', 'gemini-2.5-flash-lite']);
   });
 
-  it('models.list APIから正常にモデル一覧を取得し、適切にフィルタ・ソートする', () => {
+  it('models.list APIから正常にモデル一覧を取得し、適切にフィルタ・ソートして最大3件に絞り込む', () => {
     const mockApiResponse = {
       models: [
         { name: 'models/gemini-1.5-pro', supportedGenerationMethods: ['generateContent'] },
@@ -257,13 +257,11 @@ describe('getAvailableGeminiModels()', () => {
 
     const result = getAvailableGeminiModels('test-key');
 
-    // 安定版 Flash がバージョン降順で優先され、プレビュー版は後、非Flashはさらに後になる
+    // 安定版 Flash がバージョン降順で優先され、最大3件に絞り込まれる
+    expect(result.length).toBe(3);
     expect(result[0]).toBe('gemini-3.5-flash');
     expect(result[1]).toBe('gemini-2.5-flash');
     expect(result[2]).toBe('gemini-2.5-flash-lite');
-    expect(result).toContain('gemini-1.5-pro');
-    expect(result).not.toContain('gemini-2.5-flash-image');
-    expect(result).not.toContain('text-embedding-004');
   });
 
   it('models.list APIがHTTPエラーを返した場合、デフォルトモデルリストを返す', () => {
@@ -759,14 +757,105 @@ describe('syncAndNotify()', () => {
 
     const count = syncAndNotify();
     expect(count).toBe(2);
-    // 最初の記事で2つのモデルが試行され、すべて失敗したためサーキットブレーカー作動。2つ目の記事ではgenerateContentは呼ばれない
-    expect(geminiCallCount).toBe(2);
+    // 最初の記事で400エラー検知時に即座にサーキットブレーカー作動。フォールバックや2つ目の記事でのgenerateContentは呼ばれない
+    expect(geminiCallCount).toBe(1);
 
     // 2件目の記事は「Gemini APIが一時的に利用不可のため〜」という要約になることを検証
     const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
     expect(slackCalls.length).toBe(2);
     const payload2 = JSON.parse(slackCalls[1][1].payload);
     expect(payload2.blocks[3].text.text).toContain('Gemini APIが一時的に利用不可');
+  });
+
+  it('Gemini APIがレートリミット（429）を返した場合、フォールバックせずに即座にサーキットブレーカーを作動させる', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+      { url: 'https://example.com/article2', title: '記事2' },
+    ];
+    setupXmlServiceMock(articles);
+
+    let geminiCallCount = 0;
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [
+              { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+            ]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url || url === articles[1].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        geminiCallCount++;
+        // 429 Too Many Requests
+        return {
+          getContentText: jest.fn(() => '{"error":"Resource has been exhausted"}'),
+          getResponseCode: jest.fn(() => 429),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(2);
+    // 429発生により1回目のモデル呼び出しで即座にサーキットブレーカーが作動（フォールバックせず1回のみ）
+    expect(geminiCallCount).toBe(1);
+
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(2);
+    const payload2 = JSON.parse(slackCalls[1][1].payload);
+    expect(payload2.blocks[3].text.text).toContain('Gemini APIが一時的に利用不可');
+  });
+
+  it('処理時間が4分（240秒）を超過した場合、残りの記事の処理を安全に中断して正常終了する', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+      { url: 'https://example.com/article2', title: '記事2' },
+      { url: 'https://example.com/article3', title: '記事3' },
+    ];
+    setupXmlServiceMock(articles);
+    setupFetchMocksForArticles(articles);
+
+    const realDateNow = Date.now;
+    let callCount = 0;
+    // 初回（startTime）は 0、1件目ループ判定は 1000、2件目ループ判定で 241000 (4分1秒経過)
+    jest.spyOn(Date, 'now').mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) return 0; // startTime
+      if (callCount === 2) return 1000; // 1件目ループ判定
+      return 241000; // 2件目以降は4分超過
+    });
+
+    try {
+      const count = syncAndNotify();
+      // 1件目のみ処理され、2件目以降はタイムアウトガードで中断される
+      expect(count).toBe(1);
+    } finally {
+      Date.now.mockRestore();
+    }
   });
 });
 
