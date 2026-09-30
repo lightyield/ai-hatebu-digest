@@ -112,12 +112,50 @@ function getAvailableGeminiModels(apiKey) {
     flashModels.sort(sortFn);
     otherModels.sort(sortFn);
 
-    const result = [...flashModels, ...otherModels];
-    if (result.length > 0) {
-      return result.slice(0, MAX_CANDIDATE_MODELS);
+    const pool = flashModels.length > 0 ? flashModels : otherModels;
+    if (pool.length === 0) return DEFAULT_MODELS;
+
+    // 特性分散型の候補選定（最新標準モデル、最新Liteモデル、最も成熟した標準モデル）
+    const liteModels = pool.filter(m => m.toLowerCase().includes('lite'));
+    const standardModels = pool.filter(m => !m.toLowerCase().includes('lite'));
+
+    const selected = [];
+
+    // ① 最新の標準Flashモデル（先頭）
+    if (standardModels.length > 0) {
+      selected.push(standardModels[0]);
     }
 
-    return DEFAULT_MODELS;
+    // ② 最新の軽量Liteモデル（先頭）- 軽量・別クラスタで過負荷耐性が高い
+    if (liteModels.length > 0 && !selected.includes(liteModels[0])) {
+      selected.push(liteModels[0]);
+    }
+
+    // ③ 最も成熟した標準Flashモデル（末尾）- インフラが確立しており安定稼働
+    if (standardModels.length > 1) {
+      const stableStandards = standardModels.filter(m => !m.toLowerCase().includes('preview') && !m.toLowerCase().includes('exp'));
+      const matureModel = stableStandards.length > 0 ? stableStandards[stableStandards.length - 1] : standardModels[standardModels.length - 1];
+      if (!selected.includes(matureModel)) {
+        selected.push(matureModel);
+      }
+    }
+
+    // 候補数が上限（3件）に満たない場合は、プールからバージョン降順で重複なく補完
+    for (let i = 0; i < pool.length; i++) {
+      if (selected.length >= MAX_CANDIDATE_MODELS) break;
+      if (!selected.includes(pool[i])) {
+        selected.push(pool[i]);
+      }
+    }
+    // それでも足りず otherModels がある場合も補完
+    for (let i = 0; i < otherModels.length; i++) {
+      if (selected.length >= MAX_CANDIDATE_MODELS) break;
+      if (!selected.includes(otherModels[i])) {
+        selected.push(otherModels[i]);
+      }
+    }
+
+    return selected.slice(0, MAX_CANDIDATE_MODELS);
   } catch (e) {
     console.warn("Geminiモデル一覧取得中に例外が発生しました: ", e);
     return DEFAULT_MODELS;
@@ -166,9 +204,10 @@ function syncAndNotify() {
   
   if (newArticles.length === 0) return 0; // 新着記事なし
   
-  // 4. 動的モデル一覧の取得 (上位最大3件)
+  // 4. 動的モデル一覧の取得 (上位最大3件: 最新標準、最新Lite、成熟下位標準)
   const MODEL_LIST = getAvailableGeminiModels(props.GEMINI_API_KEY);
-  let geminiServiceUnavailable = false;
+  let activeModelList = [...MODEL_LIST];
+  let geminiFatalError = false;
 
   // 5. 各記事の処理
   let processedCount = 0;
@@ -266,7 +305,7 @@ function syncAndNotify() {
       
       // b. Gemini APIによる要約
       let summary = "要約を取得できませんでした。";
-      if (geminiServiceUnavailable) {
+      if (geminiFatalError) {
         summary = "Gemini APIが一時的に利用不可のため、要約処理をスキップしました。";
       } else {
         try {
@@ -277,8 +316,9 @@ function syncAndNotify() {
           };
           
           let succeeded = false;
-          for (let m = 0; m < MODEL_LIST.length; m++) {
-            const currentModel = MODEL_LIST[m];
+          let successfulModel = null;
+          for (let m = 0; m < activeModelList.length; m++) {
+            const currentModel = activeModelList[m];
             let attempt = 1;
             const maxAttempts = 2;
             let delayMs = 1500;
@@ -302,18 +342,20 @@ function syncAndNotify() {
                     if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
                       summary = candidate.content.parts[0].text;
                       succeeded = true;
+                      successfulModel = currentModel;
                       break;
                     } else if (candidate.finishReason) {
                       summary = `要約を取得できませんでした (理由: ${candidate.finishReason})`;
                       console.warn(`Gemini API 判定ブロック: ${candidate.finishReason} - URL: ${article.url}`);
                       succeeded = true; // ブロックはモデルの判定結果のためリトライ・フォールバック不要
+                      successfulModel = currentModel;
                       break;
                     }
                   }
                 } else if (responseCode === 429) {
                   // レートリミット（無料枠制限 / Quota Exceeded）
                   console.warn(`Gemini API レートリミット超過 (${responseCode}): `, geminiRes.getContentText());
-                  geminiServiceUnavailable = true; // モデルを変えても同じAPIキー全体で制限されるため即座にサーキットブレーカー発動
+                  geminiFatalError = true; // 1日の利用上限枯渇のため即座にサーキットブレーカー発動
                   break;
                 } else if (responseCode === 503) {
                   // 一時的過負荷: リトライし、ダメならフォールバック
@@ -334,11 +376,11 @@ function syncAndNotify() {
                 } else if (responseCode === 400) {
                   // 不正なリクエスト / APIキー不正等
                   console.warn(`Gemini API リクエストエラー (${responseCode}): `, geminiRes.getContentText());
-                  geminiServiceUnavailable = true;
+                  geminiFatalError = true;
                   break;
                 } else {
                   console.warn(`Gemini API 恒常的エラー (${responseCode}): `, geminiRes.getContentText());
-                  geminiServiceUnavailable = true;
+                  geminiFatalError = true;
                   break;
                 }
               } catch (e) {
@@ -354,18 +396,23 @@ function syncAndNotify() {
               }
             }
 
-            if (succeeded || geminiServiceUnavailable) {
+            if (succeeded || geminiFatalError) {
               break;
             }
 
-            if (shouldFallback && m < MODEL_LIST.length - 1) {
-              console.warn(`モデル ${currentModel} から次候補モデル ${MODEL_LIST[m + 1]} へフォールバックします。`);
+            if (shouldFallback && m < activeModelList.length - 1) {
+              console.warn(`モデル ${currentModel} から次候補モデル ${activeModelList[m + 1]} へフォールバックします。`);
             }
           }
 
-          if (!succeeded && !geminiServiceUnavailable) {
-            console.warn("すべてのGeminiモデル候補で要約生成に失敗しました。以降の記事のAPI呼び出しを一時停止します。");
-            geminiServiceUnavailable = true;
+          // 成功したモデルがあれば、次回記事で優先利用（先頭に配置）
+          if (successfulModel && activeModelList[0] !== successfulModel) {
+            activeModelList = [successfulModel, ...activeModelList.filter(m => m !== successfulModel)];
+          }
+
+          if (!succeeded && !geminiFatalError) {
+            console.warn(`この記事 (${article.url}) では利用可能な全モデルで一時的過負荷等のため要約を取得できませんでした。次の記事の処理を継続します。`);
+            summary = "一時的なサーバー混雑等のため、この記事の要約を取得できませんでした。";
           }
         } catch (e) {
           console.warn("Gemini API要約処理プロセス全体で例外が発生しました: " + article.url, e);
@@ -454,8 +501,8 @@ function syncAndNotify() {
     } catch (err) {
       console.error("記事の処理中に重大なエラーが発生しました (" + article.url + "): ", err);
     } finally {
-      // APIレートリミットを考慮して少し待機
-      Utilities.sleep(1500);
+      // APIレートリミットおよび短時間バースト防止のため待機
+      Utilities.sleep(2500);
     }
   }
   
