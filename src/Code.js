@@ -164,7 +164,8 @@ function getAvailableGeminiModels(apiKey) {
 
 function syncAndNotify() {
   const startTime = Date.now();
-  const MAX_EXECUTION_TIME_MS = 240 * 1000; // 4分（GAS最大実行時間6分に対する安全マージン）
+  const MAX_EXECUTION_TIME_MS = 210 * 1000; // 3分30秒（新規記事処理開始の上限）
+  const MAX_GEMINI_TIME_MS = 250 * 1000;    // 4分10秒（Gemini APIリトライ・フォールバック試行の上限）
   const props = getProperties();
   const rssUrl = props.HATENA_RSS_URL;
   
@@ -212,9 +213,9 @@ function syncAndNotify() {
   // 5. 各記事の処理
   let processedCount = 0;
   for (let i = 0; i < newArticles.length; i++) {
-    // 実行時間の安全監視: 4分を超過している場合は残りの記事を次回に回して正常終了
+    // 実行時間の安全監視: 3分30秒を超過している場合は残りの記事を次回に回して正常終了
     if (Date.now() - startTime > MAX_EXECUTION_TIME_MS) {
-      console.warn(`GAS実行制限時間（4分）に達したため、残りの記事の処理を安全に終了します（処理済: ${processedCount}件）。`);
+      console.warn(`GAS実行制限時間の安全閾値（3分30秒）に達したため、残りの記事の処理を安全に終了します（処理済: ${processedCount}件）。`);
       break;
     }
 
@@ -230,9 +231,9 @@ function syncAndNotify() {
         const responseCode = pageRes.getResponseCode();
         if (responseCode === 200) {
           let html = pageRes.getContentText();
-          // script, style タグ of 除去 and プレーンテキスト of 抽出
-          html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ');
-          html = html.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ');
+          // script, style タグの除去とプレーンテキストの抽出（バックトラッキング防止のため軽量パターンを使用）
+          html = html.replace(/<script[\s\S]*?<\/script>/gi, ' ');
+          html = html.replace(/<style[\s\S]*?<\/style>/gi, ' ');
           html = html.replace(/<[^>]+>/g, ' '); // HTMLタグを除去
           html = html.replace(/\s+/g, ' ').trim(); // 空白を正規化
           
@@ -317,6 +318,7 @@ function syncAndNotify() {
           
           let succeeded = false;
           let successfulModel = null;
+          let geminiTimeExceeded = false;
           for (let m = 0; m < activeModelList.length; m++) {
             const currentModel = activeModelList[m];
             let attempt = 1;
@@ -325,6 +327,12 @@ function syncAndNotify() {
             let shouldFallback = false;
 
             while (attempt <= maxAttempts) {
+              // Gemini API呼び出し前の時間ガード（リトライやフォールバックで6分制限を超過するのを防ぐ）
+              if (Date.now() - startTime > MAX_GEMINI_TIME_MS) {
+                console.warn(`Gemini API試行中に制限時間の安全閾値（4分10秒）を超過したため、要約リトライ・フォールバックを中断します: ${article.url}`);
+                geminiTimeExceeded = true;
+                break;
+              }
               const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${props.GEMINI_API_KEY}`;
               try {
                 const geminiRes = UrlFetchApp.fetch(geminiUrl, {
@@ -396,7 +404,7 @@ function syncAndNotify() {
               }
             }
 
-            if (succeeded || geminiFatalError) {
+            if (succeeded || geminiFatalError || geminiTimeExceeded) {
               break;
             }
 
@@ -411,8 +419,12 @@ function syncAndNotify() {
           }
 
           if (!succeeded && !geminiFatalError) {
-            console.warn(`この記事 (${article.url}) では利用可能な全モデルで一時的過負荷等のため要約を取得できませんでした。次の記事の処理を継続します。`);
-            summary = "一時的なサーバー混雑等のため、この記事の要約を取得できませんでした。";
+            if (geminiTimeExceeded) {
+              summary = "実行時間の制限に近づいたため、この記事の要約処理をスキップしました。";
+            } else {
+              console.warn(`この記事 (${article.url}) では利用可能な全モデルで一時的過負荷等のため要約を取得できませんでした。次の記事の処理を継続します。`);
+              summary = "一時的なサーバー混雑等のため、この記事の要約を取得できませんでした。";
+            }
           }
         } catch (e) {
           console.warn("Gemini API要約処理プロセス全体で例外が発生しました: " + article.url, e);
@@ -625,8 +637,8 @@ function runDiagnostics() {
         console.log("元HTML文字数: " + html.length + "文字");
         
         // クレンジング処理
-        html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ');
-        html = html.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ');
+        html = html.replace(/<script[\s\S]*?<\/script>/gi, ' ');
+        html = html.replace(/<style[\s\S]*?<\/style>/gi, ' ');
         html = html.replace(/<[^>]+>/g, ' ');
         html = html.replace(/\s+/g, ' ').trim();
         textContent = html.substring(0, 8000);
