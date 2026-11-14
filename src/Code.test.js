@@ -460,17 +460,17 @@ describe('syncAndNotify()', () => {
     expect(count).toBe(1);
   });
 
-  it('最大5件を超えるRSS記事が来ても5件のみ処理する', () => {
+  it('最大3件を超えるRSS記事が来ても3件のみ処理する', () => {
     const articles = Array.from({ length: 15 }, (_, i) => ({
       url: `https://example.com/article${i + 1}`,
       title: `記事${i + 1}`,
     }));
 
     setupXmlServiceMock(articles);
-    setupFetchMocksForArticles(articles.slice(0, 5));
+    setupFetchMocksForArticles(articles.slice(0, 3));
 
     const count = syncAndNotify();
-    expect(count).toBe(5);
+    expect(count).toBe(3);
   });
 
   it('記事ページへのアクセスがHTTPエラー(403等)の場合、要約をスキップしSlack通知しカウントする', () => {
@@ -563,8 +563,8 @@ describe('syncAndNotify()', () => {
     
     // 1件目は例外でカウントされず（processedCount++がスキップされる）、2件目は正常にカウントされるため合計1になる
     expect(count).toBe(1);
-    // insertRowBefore は2回とも呼ばれるはず
-    expect(mockSheet.insertRowBefore).toHaveBeenCalledTimes(2);
+    // insertRowBefore は、1件目で通常保存の失敗＋catch内のフォールバック保存、および2件目の通常保存の計3回呼ばれる
+    expect(mockSheet.insertRowBefore).toHaveBeenCalledTimes(3);
   });
 
   it('本文テキストが極端に短い（150文字未満）の場合、要約をスキップしSlack警告通知を送る', () => {
@@ -1009,7 +1009,7 @@ describe('syncAndNotify()', () => {
     expect(geminiUrlsCalled[2]).toContain('gemini-2.5-flash-lite:generateContent'); // 2件目は最初からliteを呼び出す
   });
 
-  it('処理時間が3分30秒（210秒）を超過した場合、残りの記事の処理を安全に中断して正常終了する', () => {
+  it('処理時間が2分30秒（150秒）を超過した場合、残りの記事の処理を安全に中断して正常終了する', () => {
     const articles = [
       { url: 'https://example.com/article1', title: '記事1' },
       { url: 'https://example.com/article2', title: '記事2' },
@@ -1018,13 +1018,10 @@ describe('syncAndNotify()', () => {
     setupXmlServiceMock(articles);
     setupFetchMocksForArticles(articles);
 
-    let callCount = 0;
-    // 初回（startTime）は 0、1件目ループ判定と1件目Gemini呼び出し判定は 1000、2件目ループ判定で 211000 (3分31秒経過)
-    jest.spyOn(Date, 'now').mockImplementation(() => {
-      callCount++;
-      if (callCount === 1) return 0; // startTime
-      if (callCount <= 3) return 1000; // 1件目ループ判定・Gemini判定
-      return 211000; // 2件目以降は3分30秒超過
+    let currentTime = 1000;
+    jest.spyOn(Date, 'now').mockImplementation(() => currentTime);
+    mockSheet.insertRowBefore.mockImplementation(() => {
+      currentTime = 155000; // 1件目保存完了後に155秒経過（> 150秒）へ進める
     });
 
     try {
@@ -1036,13 +1033,16 @@ describe('syncAndNotify()', () => {
     }
   });
 
-  it('Gemini APIのリトライ・フォールバック中に4分10秒（250秒）を超過した場合、直ちに要約試行を打ち切って記事処理を完了させる', () => {
+  it('Gemini APIのリトライ・フォールバック中に3分20秒（200秒）を超過した場合、直ちに要約試行を打ち切って記事処理を完了させる', () => {
     const articles = [
       { url: 'https://example.com/article1', title: '記事1' },
     ];
     setupXmlServiceMock(articles);
 
     let geminiCallCount = 0;
+    let currentTime = 1000;
+    jest.spyOn(Date, 'now').mockImplementation(() => currentTime);
+
     global.UrlFetchApp.fetch.mockImplementation((url) => {
       if (url === mockProps.HATENA_RSS_URL) {
         return {
@@ -1069,6 +1069,7 @@ describe('syncAndNotify()', () => {
       }
       if (url.includes(':generateContent')) {
         geminiCallCount++;
+        currentTime = 205000; // 1回目の503レスポンス後に205秒経過（> 200秒）へ進める
         return {
           getContentText: jest.fn(() => '{"error":{"code":503,"message":"unavailable"}}'),
           getResponseCode: jest.fn(() => 503),
@@ -1086,16 +1087,6 @@ describe('syncAndNotify()', () => {
       };
     });
 
-    let callCount = 0;
-    // startTime: 0, 1件目記事ループ先頭: 200000 (3分20秒), 1回目Gemini試行前: 205000, 2回目リトライ試行前: 251000 (4分11秒経過)
-    jest.spyOn(Date, 'now').mockImplementation(() => {
-      callCount++;
-      if (callCount === 1) return 0;      // startTime
-      if (callCount === 2) return 200000; // 記事ループ先頭 (< 210秒)
-      if (callCount === 3) return 205000; // 1回目Gemini試行前 (< 250秒)
-      return 251000;                      // 2回目リトライ試行前 (> 250秒)
-    });
-
     try {
       const count = syncAndNotify();
       expect(count).toBe(1);
@@ -1109,6 +1100,236 @@ describe('syncAndNotify()', () => {
     } finally {
       Date.now.mockRestore();
     }
+  });
+
+  it('スクレイピング前に3分00秒（180秒）を超過した場合、本文取得をスキップして要約スキップ通知を送る', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+    ];
+    setupXmlServiceMock(articles);
+
+    let currentTime = 1000;
+    let scrapeFetchCalled = false;
+    let passedLoopCheck = false;
+    jest.spyOn(Date, 'now').mockImplementation(() => {
+      if (passedLoopCheck) {
+        return 185000; // スクレイピング判定以降は185秒経過（> 180秒）
+      }
+      if (currentTime === 140000) {
+        passedLoopCheck = true; // 記事ループ先頭チェックを通過
+      }
+      return currentTime;
+    });
+
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        // モデル一覧取得後に時刻を140秒へ進める（記事ループ先頭の150秒判定は通過する）
+        currentTime = 140000;
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [{ name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        scrapeFetchCalled = true;
+        return {
+          getContentText: jest.fn(() => '<html><body>本文</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    try {
+      const count = syncAndNotify();
+      expect(count).toBe(1);
+      // スクレイピングのfetchはスキップされる
+      expect(scrapeFetchCalled).toBe(false);
+
+      // Slack通知にスキップ理由が含まれていることを確認
+      const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+      expect(slackCalls.length).toBe(1);
+      const payload = JSON.parse(slackCalls[0][1].payload);
+      expect(payload.blocks[3].text.text).toContain('実行時間の制限に近づいたため、記事本文の取得をスキップしました');
+    } finally {
+      Date.now.mockRestore();
+    }
+  });
+
+  it('はてなブコメ取得前に4分00秒（240秒）を超過した場合、ブコメAPIのfetchをスキップする', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+    ];
+    setupXmlServiceMock(articles);
+
+    let currentTime = 1000;
+    let bApiFetchCalled = false;
+    jest.spyOn(Date, 'now').mockImplementation(() => currentTime);
+
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [{ name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        // Gemini成功後に時刻を245秒（> 240秒）へ進める
+        currentTime = 245000;
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            candidates: [{ content: { parts: [{ text: '要約テスト' }] } }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp/entry/jsonlite')) {
+        bApiFetchCalled = true;
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    try {
+      const count = syncAndNotify();
+      expect(count).toBe(1);
+      // ブコメ取得のfetchはスキップされる
+      expect(bApiFetchCalled).toBe(false);
+
+      // Slack通知のブコメ欄に制限警告が含まれる
+      const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+      expect(slackCalls.length).toBe(1);
+      const payload = JSON.parse(slackCalls[0][1].payload);
+      expect(payload.blocks[5].text.text).toContain('実行時間の制限に近づいたため、コメント取得をスキップしました');
+    } finally {
+      Date.now.mockRestore();
+    }
+  });
+
+  it('Slack通知送信前に4分30秒（270秒）を超過した場合、Slack通知のfetchをスキップしスプレッドシートに保存する', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+    ];
+    setupXmlServiceMock(articles);
+
+    let currentTime = 1000;
+    jest.spyOn(Date, 'now').mockImplementation(() => currentTime);
+
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [{ name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            candidates: [{ content: { parts: [{ text: '要約テスト' }] } }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp/entry/jsonlite')) {
+        // ブコメ取得後に275秒（> 270秒）へ進める
+        currentTime = 275000;
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    try {
+      const count = syncAndNotify();
+      expect(count).toBe(1);
+
+      // Slack通知のfetchは呼ばれない
+      const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+      expect(slackCalls.length).toBe(0);
+
+      // スプレッドシートには保存される
+      expect(mockSheet.insertRowBefore).toHaveBeenCalledWith(1);
+      expect(mockSheet.getRange().setValue).toHaveBeenCalledWith(articles[0].url);
+    } finally {
+      Date.now.mockRestore();
+    }
+  });
+
+  it('記事の処理中に重大な例外が発生した場合でも、スプレッドシートにURLを保存して翌日の再試行ループを防止する', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: 'テスト記事' },
+    ];
+    setupXmlServiceMock(articles);
+    setupFetchMocksForArticles(articles);
+
+    let setValueCalls = 0;
+    mockSheet.getRange.mockImplementation(() => ({
+      getValues: jest.fn(() => []),
+      setValue: jest.fn(() => {
+        setValueCalls++;
+        // 通常の保存処理（1回目）で予期せぬ例外を発生させる
+        if (setValueCalls === 1) {
+          throw new Error('Database disk full error');
+        }
+      }),
+    }));
+
+    const count = syncAndNotify();
+    // 重大例外発生のため正常処理数にはカウントされない
+    expect(count).toBe(0);
+    // catchブロック内の再試行ループ防止処理により、setValueが2回（失敗した通常保存＋フォールバック保存）呼ばれる
+    expect(setValueCalls).toBe(2);
+    expect(mockSheet.insertRowBefore).toHaveBeenCalledWith(1);
   });
 });
 
