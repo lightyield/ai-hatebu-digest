@@ -164,8 +164,14 @@ function getAvailableGeminiModels(apiKey) {
 
 function syncAndNotify() {
   const startTime = Date.now();
-  const MAX_EXECUTION_TIME_MS = 210 * 1000; // 3分30秒（新規記事処理開始の上限）
-  const MAX_GEMINI_TIME_MS = 250 * 1000;    // 4分10秒（Gemini APIリトライ・フォールバック試行の上限）
+  // 実行時間ガード用の安全閾値（GAS上限 360秒 / 6分 に対する多段階防御）
+  const MAX_ARTICLE_START_TIME_MS = 150 * 1000; // 2分30秒（新規記事の処理開始上限）
+  const MAX_SCRAPE_TIME_MS = 180 * 1000;        // 3分00秒（スクレイピング試行上限）
+  const MAX_GEMINI_TIME_MS = 200 * 1000;        // 3分20秒（Gemini API試行・リトライ・フォールバック上限）
+  const MAX_HATENA_TIME_MS = 240 * 1000;        // 4分00秒（はてなブコメAPI取得上限）
+  const MAX_SLACK_TIME_MS = 270 * 1000;         // 4分30秒（Slack通知送信上限）
+  const MAX_ARTICLES_PER_RUN = 3;               // 1回あたりの最大処理記事数
+
   const props = getProperties();
   const rssUrl = props.HATENA_RSS_URL;
   
@@ -190,7 +196,7 @@ function syncAndNotify() {
     sentUrls = values.map(row => row[0]).filter(url => url);
   }
   
-  // 3. 新着記事の抽出 (最大5件)
+  // 3. 新着記事の抽出 (最大3件)
   let newArticles = [];
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -199,7 +205,7 @@ function syncAndNotify() {
     
     if (!sentUrls.includes(url)) {
       newArticles.push({ url, title });
-      if (newArticles.length >= 5) break;
+      if (newArticles.length >= MAX_ARTICLES_PER_RUN) break;
     }
   }
   
@@ -213,41 +219,52 @@ function syncAndNotify() {
   // 5. 各記事の処理
   let processedCount = 0;
   for (let i = 0; i < newArticles.length; i++) {
-    // 実行時間の安全監視: 3分30秒を超過している場合は残りの記事を次回に回して正常終了
-    if (Date.now() - startTime > MAX_EXECUTION_TIME_MS) {
-      console.warn(`GAS実行制限時間の安全閾値（3分30秒）に達したため、残りの記事の処理を安全に終了します（処理済: ${processedCount}件）。`);
+    // 実行時間の安全監視: 2分30秒を超過している場合は残りの未着手記事を次回に回して正常終了
+    if (Date.now() - startTime > MAX_ARTICLE_START_TIME_MS) {
+      console.warn(`GAS実行制限時間の安全閾値（2分30秒）に達したため、残りの記事の処理を安全に終了します（処理済: ${processedCount}件）。未着手の記事は次回実行時に再処理されます。`);
       break;
     }
 
     const article = newArticles[i];
+    const articleStartTime = Date.now();
+    console.log(`[記事処理開始 ${i + 1}/${newArticles.length}] ${article.title} (${article.url}) - 累積経過時間: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
     
     try {
       // a. 記事本文のスクレイピング
       let textContent = "";
       let scrapeSkipped = false;
       let scrapeSkipReason = "";
-      try {
-        const pageRes = UrlFetchApp.fetch(article.url, {muteHttpExceptions: true});
-        const responseCode = pageRes.getResponseCode();
-        if (responseCode === 200) {
-          let html = pageRes.getContentText();
-          // script, style タグの除去とプレーンテキストの抽出（バックトラッキング防止のため軽量パターンを使用）
-          html = html.replace(/<script[\s\S]*?<\/script>/gi, ' ');
-          html = html.replace(/<style[\s\S]*?<\/style>/gi, ' ');
-          html = html.replace(/<[^>]+>/g, ' '); // HTMLタグを除去
-          html = html.replace(/\s+/g, ' ').trim(); // 空白を正規化
-          
-          textContent = html.substring(0, 8000); // 制限を設ける
-        } else {
-          // 200以外のステータスコード（ペイウォール、リダイレクト、複数ページ等）
-          scrapeSkipped = true;
-          scrapeSkipReason = `記事本文へのアクセスに失敗しました（HTTPステータス: ${responseCode}）。複数ページ構成やアクセス制限の可能性があります。`;
-          console.warn("スクレイピングスキップ (" + responseCode + "): " + article.url);
-        }
-      } catch (e) {
+
+      if (Date.now() - startTime > MAX_SCRAPE_TIME_MS) {
         scrapeSkipped = true;
-        scrapeSkipReason = "記事本文の取得中にエラーが発生しました。";
-        console.warn("スクレイピング失敗: " + article.url, e);
+        scrapeSkipReason = "実行時間の制限に近づいたため、記事本文の取得をスキップしました。";
+        console.warn(`スクレイピング試行前に安全閾値（3分00秒）を超過したため、本文取得をスキップします: ${article.url}`);
+      } else {
+        const scrapeStart = Date.now();
+        try {
+          const pageRes = UrlFetchApp.fetch(article.url, {muteHttpExceptions: true});
+          const responseCode = pageRes.getResponseCode();
+          if (responseCode === 200) {
+            let html = pageRes.getContentText();
+            // script, style タグの除去とプレーンテキストの抽出（バックトラッキング防止のため軽量パターンを使用）
+            html = html.replace(/<script[\s\S]*?<\/script>/gi, ' ');
+            html = html.replace(/<style[\s\S]*?<\/style>/gi, ' ');
+            html = html.replace(/<[^>]+>/g, ' '); // HTMLタグを除去
+            html = html.replace(/\s+/g, ' ').trim(); // 空白を正規化
+            
+            textContent = html.substring(0, 8000); // 制限を設ける
+          } else {
+            // 200以外のステータスコード（ペイウォール、リダイレクト、複数ページ等）
+            scrapeSkipped = true;
+            scrapeSkipReason = `記事本文へのアクセスに失敗しました（HTTPステータス: ${responseCode}）。複数ページ構成やアクセス制限の可能性があります。`;
+            console.warn("スクレイピングスキップ (" + responseCode + "): " + article.url);
+          }
+        } catch (e) {
+          scrapeSkipped = true;
+          scrapeSkipReason = "記事本文の取得中にエラーが発生しました。";
+          console.warn("スクレイピング失敗: " + article.url, e);
+        }
+        console.log(`[スクレイピング完了] 所要時間: ${Date.now() - scrapeStart}ms, 取得文字数: ${textContent ? textContent.length : 0}文字`);
       }
       
       // テキストが取れなかった、または極端に短い場合もスキップ扱い
@@ -287,15 +304,19 @@ function syncAndNotify() {
             }
           }
         ];
-        try {
-          UrlFetchApp.fetch(props.SLACK_WEBHOOK_URL, {
-            method: 'post',
-            contentType: 'application/json',
-            payload: JSON.stringify({ blocks: skipBlocks }),
-            muteHttpExceptions: true
-          });
-        } catch (e) {
-          console.error("スキップ通知のSlack送信失敗", e);
+        if (Date.now() - startTime <= MAX_SLACK_TIME_MS) {
+          try {
+            UrlFetchApp.fetch(props.SLACK_WEBHOOK_URL, {
+              method: 'post',
+              contentType: 'application/json',
+              payload: JSON.stringify({ blocks: skipBlocks }),
+              muteHttpExceptions: true
+            });
+          } catch (e) {
+            console.error("スキップ通知のSlack送信失敗", e);
+          }
+        } else {
+          console.warn(`スキップ通知送信前に安全閾値（4分30秒）を超過したため、Slack通知をスキップします: ${article.url}`);
         }
         // スキップ記事もスプレッドシートに保存してカウント
         sheet.insertRowBefore(1);
@@ -309,6 +330,8 @@ function syncAndNotify() {
       if (geminiFatalError) {
         summary = "Gemini APIが一時的に利用不可のため、要約処理をスキップしました。";
       } else {
+        const geminiStart = Date.now();
+        let successfulModel = null;
         try {
           const payload = {
             contents: [{
@@ -317,7 +340,6 @@ function syncAndNotify() {
           };
           
           let succeeded = false;
-          let successfulModel = null;
           let geminiTimeExceeded = false;
           for (let m = 0; m < activeModelList.length; m++) {
             const currentModel = activeModelList[m];
@@ -329,7 +351,7 @@ function syncAndNotify() {
             while (attempt <= maxAttempts) {
               // Gemini API呼び出し前の時間ガード（リトライやフォールバックで6分制限を超過するのを防ぐ）
               if (Date.now() - startTime > MAX_GEMINI_TIME_MS) {
-                console.warn(`Gemini API試行中に制限時間の安全閾値（4分10秒）を超過したため、要約リトライ・フォールバックを中断します: ${article.url}`);
+                console.warn(`Gemini API試行中に制限時間の安全閾値（3分20秒）を超過したため、要約リトライ・フォールバックを中断します: ${article.url}`);
                 geminiTimeExceeded = true;
                 break;
               }
@@ -429,28 +451,36 @@ function syncAndNotify() {
         } catch (e) {
           console.warn("Gemini API要約処理プロセス全体で例外が発生しました: " + article.url, e);
         }
+        console.log(`[Gemini要約完了] モデル: ${successfulModel || 'なし'}, 所要時間: ${Date.now() - geminiStart}ms`);
       }
       
       // c. はてなブックマーク JSONLite API でブコメ取得
       let commentsText = "";
-      try {
-        const bApiUrl = `https://b.hatena.ne.jp/entry/jsonlite/?url=${encodeURIComponent(article.url)}`;
-        const bRes = UrlFetchApp.fetch(bApiUrl, {muteHttpExceptions: true});
-        if (bRes.getResponseCode() === 200) {
-          const bData = JSON.parse(bRes.getContentText());
-          if (bData && bData.bookmarks) {
-            // コメントが空でないものを最大10件抽出
-            const comments = bData.bookmarks.filter(b => b.comment.trim() !== "").slice(0, 10);
-            if (comments.length > 0) {
-              commentsText = comments.map(c => `• *${c.user}*: ${c.comment}`).join('\n');
-            } else {
-              commentsText = "コメントはまだありません。";
+      if (Date.now() - startTime > MAX_HATENA_TIME_MS) {
+        console.warn(`ブコメ取得前に安全閾値（4分00秒）を超過したため、コメント取得をスキップします: ${article.url}`);
+        commentsText = "実行時間の制限に近づいたため、コメント取得をスキップしました。";
+      } else {
+        const bApiStart = Date.now();
+        try {
+          const bApiUrl = `https://b.hatena.ne.jp/entry/jsonlite/?url=${encodeURIComponent(article.url)}`;
+          const bRes = UrlFetchApp.fetch(bApiUrl, {muteHttpExceptions: true});
+          if (bRes.getResponseCode() === 200) {
+            const bData = JSON.parse(bRes.getContentText());
+            if (bData && bData.bookmarks) {
+              // コメントが空でないものを最大10件抽出
+              const comments = bData.bookmarks.filter(b => b.comment.trim() !== "").slice(0, 10);
+              if (comments.length > 0) {
+                commentsText = comments.map(c => `• *${c.user}*: ${c.comment}`).join('\n');
+              } else {
+                commentsText = "コメントはまだありません。";
+              }
             }
           }
+        } catch (e) {
+          console.warn("はてなブコメ取得失敗: " + article.url, e);
+          commentsText = "コメントの取得に失敗しました。";
         }
-      } catch (e) {
-        console.warn("はてなブコメ取得失敗: " + article.url, e);
-        commentsText = "コメントの取得に失敗しました。";
+        console.log(`[ブコメ取得完了] 所要時間: ${Date.now() - bApiStart}ms`);
       }
       if (!commentsText) commentsText = "コメントはまだありません。";
       
@@ -494,15 +524,21 @@ function syncAndNotify() {
       ];
       
       // e. Slackへの送信
-      try {
-        UrlFetchApp.fetch(props.SLACK_WEBHOOK_URL, {
-          method: 'post',
-          contentType: 'application/json',
-          payload: JSON.stringify({ blocks: blocks }),
-          muteHttpExceptions: true
-        });
-      } catch (e) {
-        console.error("Slack通知失敗", e);
+      if (Date.now() - startTime > MAX_SLACK_TIME_MS) {
+        console.warn(`Slack通知送信前に安全閾値（4分30秒）を超過したため、Slack通知をスキップします: ${article.url}`);
+      } else {
+        const slackStart = Date.now();
+        try {
+          UrlFetchApp.fetch(props.SLACK_WEBHOOK_URL, {
+            method: 'post',
+            contentType: 'application/json',
+            payload: JSON.stringify({ blocks: blocks }),
+            muteHttpExceptions: true
+          });
+        } catch (e) {
+          console.error("Slack通知失敗", e);
+        }
+        console.log(`[Slack送信完了] 所要時間: ${Date.now() - slackStart}ms`);
       }
       
       // f. スプレッドシートに送信済URLを保存 (先頭に挿入)
@@ -510,8 +546,16 @@ function syncAndNotify() {
       sheet.getRange(1, 1).setValue(article.url);
 
       processedCount++;
+      console.log(`[記事処理完了 ${i + 1}/${newArticles.length}] 所要時間: ${Date.now() - articleStartTime}ms, 累積経過時間: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
     } catch (err) {
       console.error("記事の処理中に重大なエラーが発生しました (" + article.url + "): ", err);
+      // 再試行ループ防止: 重大なエラーが発生した記事もスプレッドシートに記録して翌日のスタックを防止
+      try {
+        sheet.insertRowBefore(1);
+        sheet.getRange(1, 1).setValue(article.url);
+      } catch (sheetErr) {
+        console.error("エラー記事の履歴保存に失敗しました: " + article.url, sheetErr);
+      }
     } finally {
       // APIレートリミットおよび短時間バースト防止のため待機
       Utilities.sleep(2500);
