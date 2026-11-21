@@ -162,20 +162,123 @@ function getAvailableGeminiModels(apiKey) {
   }
 }
 
+const IN_PROGRESS_ARTICLE_KEY = 'IN_PROGRESS_ARTICLE';
+
+/**
+ * レスポンスヘッダーから大文字小文字を区別せず指定キーの値を取得する
+ * @param {Object} headers
+ * @param {string} targetName
+ * @returns {string}
+ */
+function getHeaderCaseInsensitive(headers, targetName) {
+  if (!headers || typeof headers !== 'object') return '';
+  const lowerTarget = targetName.toLowerCase();
+  const keys = Object.keys(headers);
+  for (let i = 0; i < keys.length; i++) {
+    if (keys[i].toLowerCase() === lowerTarget) {
+      return String(headers[keys[i]] || '');
+    }
+  }
+  return '';
+}
+
+/**
+ * Content-Type がHTML/テキスト系かどうかを判定する（ヘッダー未設定時は許容）
+ * @param {string} contentType
+ * @returns {boolean}
+ */
+function isHtmlOrTextContentType(contentType) {
+  if (!contentType) return true;
+  const lower = contentType.toLowerCase();
+  return (
+    lower.includes('text/') ||
+    lower.includes('application/xhtml+xml') ||
+    lower.includes('application/xml') ||
+    lower.includes('application/json')
+  );
+}
+
+/**
+ * 指定タグのブロック（<tag ...>...</tag>）を線形時間 O(N) で安全に除去する
+ * 正規表現によるバックトラッキング（ReDoS / CPUハング）を理論上防止する
+ * @param {string} html
+ * @param {string} tagName
+ * @returns {string}
+ */
+function stripTagBlocks(html, tagName) {
+  if (!html) return '';
+  const openToken = `<${tagName}`;
+  const closeToken = `</${tagName}`;
+  const lower = html.toLowerCase();
+  let result = '';
+  let cursor = 0;
+
+  while (cursor < html.length) {
+    const startIdx = lower.indexOf(openToken, cursor);
+    if (startIdx === -1) {
+      result += html.substring(cursor);
+      break;
+    }
+    // タグ名の直後が空白・'>'・'/' であることを確認（<scripted>等の誤爆防止）
+    const nextChar = lower.charAt(startIdx + openToken.length);
+    if (nextChar && nextChar !== '>' && nextChar !== '/' && !/\s/.test(nextChar)) {
+      result += html.substring(cursor, startIdx + openToken.length);
+      cursor = startIdx + openToken.length;
+      continue;
+    }
+
+    result += html.substring(cursor, startIdx) + ' ';
+    const closeIdx = lower.indexOf(closeToken, startIdx + openToken.length);
+    if (closeIdx === -1) {
+      // 閉じタグが無い場合は残りをすべて除去して終了
+      break;
+    }
+    const closeEndIdx = lower.indexOf('>', closeIdx + closeToken.length);
+    if (closeEndIdx === -1) {
+      break;
+    }
+    cursor = closeEndIdx + 1;
+  }
+
+  return result;
+}
+
+/**
+ * HTML文字列から安全かつ高速にプレーンテキストを抽出する
+ * 巨大HTML・バイナリ混入時のCPUハングを防ぐため、クレンジング前に文字数上限を適用する
+ * @param {string} rawHtml
+ * @param {number} [maxRawLength=200000]
+ * @param {number} [maxOutputLength=6000]
+ * @returns {string}
+ */
+function extractPlainTextFromHtml(rawHtml, maxRawLength = 200000, maxOutputLength = 6000) {
+  if (!rawHtml || typeof rawHtml !== 'string') return '';
+  let html = rawHtml.length > maxRawLength ? rawHtml.substring(0, maxRawLength) : rawHtml;
+  html = stripTagBlocks(html, 'script');
+  html = stripTagBlocks(html, 'style');
+  html = stripTagBlocks(html, 'noscript');
+  html = html.replace(/<[^>]*>/g, ' ');
+  html = html.replace(/\s+/g, ' ').trim();
+  return html.substring(0, maxOutputLength);
+}
+
 function syncAndNotify() {
   const startTime = Date.now();
   // 実行時間ガード用の安全閾値（GAS上限 360秒 / 6分 に対する多段階防御）
-  const MAX_ARTICLE_START_TIME_MS = 150 * 1000; // 2分30秒（新規記事の処理開始上限）
-  const MAX_SCRAPE_TIME_MS = 180 * 1000;        // 3分00秒（スクレイピング試行上限）
-  const MAX_GEMINI_TIME_MS = 200 * 1000;        // 3分20秒（Gemini API試行・リトライ・フォールバック上限）
-  const MAX_HATENA_TIME_MS = 240 * 1000;        // 4分00秒（はてなブコメAPI取得上限）
-  const MAX_SLACK_TIME_MS = 270 * 1000;         // 4分30秒（Slack通知送信上限）
+  const MAX_ARTICLE_START_TIME_MS = 120 * 1000; // 2分00秒（新規記事の処理開始上限）
+  const MAX_SCRAPE_TIME_MS = 140 * 1000;        // 2分20秒（スクレイピング試行上限）
+  const MAX_GEMINI_TIME_MS = 160 * 1000;        // 2分40秒（Gemini API試行・リトライ・フォールバック上限）
+  const MAX_HATENA_TIME_MS = 210 * 1000;        // 3分30秒（はてなブコメAPI取得上限）
+  const MAX_SLACK_TIME_MS = 240 * 1000;         // 4分00秒（Slack通知送信上限）
+  const SLOW_ATTEMPT_FALLBACK_MS = 15 * 1000;   // 15秒以上かかった失敗試行は同一モデル再試行せず即フォールバック
   const MAX_ARTICLES_PER_RUN = 3;               // 1回あたりの最大処理記事数
 
   const props = getProperties();
+  const scriptProps = PropertiesService.getScriptProperties();
   const rssUrl = props.HATENA_RSS_URL;
   
   // 1. RSSの取得
+  console.log(`[RSS取得開始] ${rssUrl}`);
   const response = UrlFetchApp.fetch(rssUrl);
   const xml = response.getContentText();
   const document = XmlService.parse(xml);
@@ -194,6 +297,70 @@ function syncAndNotify() {
   if (lastRow > 0) {
     const values = sheet.getRange(1, 1, lastRow, 1).getValues();
     sentUrls = values.map(row => row[0]).filter(url => url);
+  }
+
+  // 2.5 クラッシュリカバリ: 前回の実行が記事処理中に6分タイムアウト等で強制終了していた場合、
+  //     該当URLを自動的に履歴登録・スキップして連日の再試行ループを遮断する
+  if (scriptProps && typeof scriptProps.getProperty === 'function') {
+    const rawInProgress = scriptProps.getProperty(IN_PROGRESS_ARTICLE_KEY);
+    if (rawInProgress) {
+      try {
+        const crashedArticle = JSON.parse(rawInProgress);
+        if (crashedArticle && crashedArticle.url) {
+          console.warn(`[クラッシュリカバリ] 前回の実行が記事処理中に強制終了（タイムアウト等）した形跡を検出しました。再試行ループを防止するため該当記事をスキップ登録します: ${crashedArticle.url}`);
+          if (!sentUrls.includes(crashedArticle.url)) {
+            sheet.insertRowBefore(1);
+            sheet.getRange(1, 1).setValue(crashedArticle.url);
+            sentUrls.push(crashedArticle.url);
+          }
+          if (props.SLACK_WEBHOOK_URL && Date.now() - startTime <= MAX_SLACK_TIME_MS) {
+            try {
+              const recoveryBlocks = [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": (crashedArticle.title || "前回タイムアウト記事").substring(0, 150),
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": `<${crashedArticle.url}|記事を開く>`
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":warning: *タイムアウトからの自動復旧（スキップ登録）*\n前回の実行がこの記事の処理中にGASの実行時間制限等で強制終了したため、再発防止として自動的に履歴登録・スキップしました。"
+                  }
+                }
+              ];
+              UrlFetchApp.fetch(props.SLACK_WEBHOOK_URL, {
+                method: 'post',
+                contentType: 'application/json',
+                payload: JSON.stringify({ blocks: recoveryBlocks }),
+                muteHttpExceptions: true
+              });
+            } catch (notifyErr) {
+              console.warn("クラッシュリカバリ通知のSlack送信に失敗しました: ", notifyErr);
+            }
+          }
+        }
+      } catch (parseErr) {
+        console.warn("IN_PROGRESS_ARTICLE の解析に失敗しました: ", parseErr);
+      } finally {
+        if (typeof scriptProps.deleteProperty === 'function') {
+          scriptProps.deleteProperty(IN_PROGRESS_ARTICLE_KEY);
+        }
+      }
+    }
   }
   
   // 3. 新着記事の抽出 (最大3件)
@@ -219,15 +386,28 @@ function syncAndNotify() {
   // 5. 各記事の処理
   let processedCount = 0;
   for (let i = 0; i < newArticles.length; i++) {
-    // 実行時間の安全監視: 2分30秒を超過している場合は残りの未着手記事を次回に回して正常終了
+    // 実行時間の安全監視: 2分00秒を超過している場合は残りの未着手記事を次回に回して正常終了
     if (Date.now() - startTime > MAX_ARTICLE_START_TIME_MS) {
-      console.warn(`GAS実行制限時間の安全閾値（2分30秒）に達したため、残りの記事の処理を安全に終了します（処理済: ${processedCount}件）。未着手の記事は次回実行時に再処理されます。`);
+      console.warn(`GAS実行制限時間の安全閾値（2分00秒）に達したため、残りの記事の処理を安全に終了します（処理済: ${processedCount}件）。未着手の記事は次回実行時に再処理されます。`);
       break;
     }
 
     const article = newArticles[i];
     const articleStartTime = Date.now();
     console.log(`[記事処理開始 ${i + 1}/${newArticles.length}] ${article.title} (${article.url}) - 累積経過時間: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+
+    // Write-Ahead Log: 万が一この記事の処理中に6分タイムアウトで強制終了した場合に備え、処理中記事を記録
+    if (scriptProps && typeof scriptProps.setProperty === 'function') {
+      try {
+        scriptProps.setProperty(IN_PROGRESS_ARTICLE_KEY, JSON.stringify({
+          url: article.url,
+          title: article.title,
+          startedAt: new Date(articleStartTime).toISOString()
+        }));
+      } catch (propErr) {
+        console.warn("IN_PROGRESS_ARTICLE の記録に失敗しました: ", propErr);
+      }
+    }
     
     try {
       // a. 記事本文のスクレイピング
@@ -238,21 +418,24 @@ function syncAndNotify() {
       if (Date.now() - startTime > MAX_SCRAPE_TIME_MS) {
         scrapeSkipped = true;
         scrapeSkipReason = "実行時間の制限に近づいたため、記事本文の取得をスキップしました。";
-        console.warn(`スクレイピング試行前に安全閾値（3分00秒）を超過したため、本文取得をスキップします: ${article.url}`);
+        console.warn(`スクレイピング試行前に安全閾値（2分20秒）を超過したため、本文取得をスキップします: ${article.url}`);
       } else {
         const scrapeStart = Date.now();
+        console.log(`[スクレイピング開始] ${article.url} - 累積経過時間: ${((scrapeStart - startTime) / 1000).toFixed(1)}s`);
         try {
           const pageRes = UrlFetchApp.fetch(article.url, {muteHttpExceptions: true});
           const responseCode = pageRes.getResponseCode();
           if (responseCode === 200) {
-            let html = pageRes.getContentText();
-            // script, style タグの除去とプレーンテキストの抽出（バックトラッキング防止のため軽量パターンを使用）
-            html = html.replace(/<script[\s\S]*?<\/script>/gi, ' ');
-            html = html.replace(/<style[\s\S]*?<\/style>/gi, ' ');
-            html = html.replace(/<[^>]+>/g, ' '); // HTMLタグを除去
-            html = html.replace(/\s+/g, ' ').trim(); // 空白を正規化
-            
-            textContent = html.substring(0, 8000); // 制限を設ける
+            const headers = typeof pageRes.getHeaders === 'function' ? pageRes.getHeaders() : null;
+            const contentType = getHeaderCaseInsensitive(headers, 'content-type');
+            if (!isHtmlOrTextContentType(contentType)) {
+              scrapeSkipped = true;
+              scrapeSkipReason = `HTML/テキスト以外のコンテンツ（Content-Type: ${contentType}）のため、要約をスキップしました。`;
+              console.warn(`非テキストコンテンツのためスクレイピングスキップ (${contentType}): ${article.url}`);
+            } else {
+              const rawHtml = pageRes.getContentText();
+              textContent = extractPlainTextFromHtml(rawHtml);
+            }
           } else {
             // 200以外のステータスコード（ペイウォール、リダイレクト、複数ページ等）
             scrapeSkipped = true;
@@ -316,7 +499,7 @@ function syncAndNotify() {
             console.error("スキップ通知のSlack送信失敗", e);
           }
         } else {
-          console.warn(`スキップ通知送信前に安全閾値（4分30秒）を超過したため、Slack通知をスキップします: ${article.url}`);
+          console.warn(`スキップ通知送信前に安全閾値（4分00秒）を超過したため、Slack通知をスキップします: ${article.url}`);
         }
         // スキップ記事もスプレッドシートに保存してカウント
         sheet.insertRowBefore(1);
@@ -331,12 +514,16 @@ function syncAndNotify() {
         summary = "Gemini APIが一時的に利用不可のため、要約処理をスキップしました。";
       } else {
         const geminiStart = Date.now();
+        console.log(`[Gemini要約開始] 候補モデル: ${JSON.stringify(activeModelList)} - 累積経過時間: ${((geminiStart - startTime) / 1000).toFixed(1)}s`);
         let successfulModel = null;
         try {
           const payload = {
             contents: [{
               parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
-            }]
+            }],
+            generationConfig: {
+              maxOutputTokens: 2048
+            }
           };
           
           let succeeded = false;
@@ -351,11 +538,12 @@ function syncAndNotify() {
             while (attempt <= maxAttempts) {
               // Gemini API呼び出し前の時間ガード（リトライやフォールバックで6分制限を超過するのを防ぐ）
               if (Date.now() - startTime > MAX_GEMINI_TIME_MS) {
-                console.warn(`Gemini API試行中に制限時間の安全閾値（3分20秒）を超過したため、要約リトライ・フォールバックを中断します: ${article.url}`);
+                console.warn(`Gemini API試行中に制限時間の安全閾値（2分40秒）を超過したため、要約リトライ・フォールバックを中断します: ${article.url}`);
                 geminiTimeExceeded = true;
                 break;
               }
               const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${props.GEMINI_API_KEY}`;
+              const attemptStart = Date.now();
               try {
                 const geminiRes = UrlFetchApp.fetch(geminiUrl, {
                   method: 'post',
@@ -364,6 +552,7 @@ function syncAndNotify() {
                   muteHttpExceptions: true
                 });
 
+                const attemptElapsedMs = Date.now() - attemptStart;
                 const responseCode = geminiRes.getResponseCode();
                 if (responseCode === 200) {
                   const geminiData = JSON.parse(geminiRes.getContentText());
@@ -388,9 +577,9 @@ function syncAndNotify() {
                   geminiFatalError = true; // 1日の利用上限枯渇のため即座にサーキットブレーカー発動
                   break;
                 } else if (responseCode === 503) {
-                  // 一時的過負荷: リトライし、ダメならフォールバック
-                  console.warn(`モデル ${currentModel} で一時的エラー (${responseCode}) - 試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
-                  if (attempt < maxAttempts) {
+                  // 一時的過負荷: 応答自体に時間がかかっていた場合は即座に次モデルへフォールバック
+                  console.warn(`モデル ${currentModel} で一時的エラー (${responseCode}, 所要 ${attemptElapsedMs}ms) - 試行 ${attempt}/${maxAttempts}: `, geminiRes.getContentText());
+                  if (attempt < maxAttempts && attemptElapsedMs < SLOW_ATTEMPT_FALLBACK_MS) {
                     Utilities.sleep(delayMs);
                     delayMs *= 2;
                     attempt++;
@@ -414,8 +603,9 @@ function syncAndNotify() {
                   break;
                 }
               } catch (e) {
-                console.warn(`モデル ${currentModel} 接続エラー - 試行 ${attempt}/${maxAttempts}: ` + article.url, e);
-                if (attempt < maxAttempts) {
+                const attemptElapsedMs = Date.now() - attemptStart;
+                console.warn(`モデル ${currentModel} 接続エラー (所要 ${attemptElapsedMs}ms) - 試行 ${attempt}/${maxAttempts}: ` + article.url, e);
+                if (attempt < maxAttempts && attemptElapsedMs < SLOW_ATTEMPT_FALLBACK_MS) {
                   Utilities.sleep(delayMs);
                   delayMs *= 2;
                   attempt++;
@@ -457,10 +647,11 @@ function syncAndNotify() {
       // c. はてなブックマーク JSONLite API でブコメ取得
       let commentsText = "";
       if (Date.now() - startTime > MAX_HATENA_TIME_MS) {
-        console.warn(`ブコメ取得前に安全閾値（4分00秒）を超過したため、コメント取得をスキップします: ${article.url}`);
+        console.warn(`ブコメ取得前に安全閾値（3分30秒）を超過したため、コメント取得をスキップします: ${article.url}`);
         commentsText = "実行時間の制限に近づいたため、コメント取得をスキップしました。";
       } else {
         const bApiStart = Date.now();
+        console.log(`[ブコメ取得開始] ${article.url} - 累積経過時間: ${((bApiStart - startTime) / 1000).toFixed(1)}s`);
         try {
           const bApiUrl = `https://b.hatena.ne.jp/entry/jsonlite/?url=${encodeURIComponent(article.url)}`;
           const bRes = UrlFetchApp.fetch(bApiUrl, {muteHttpExceptions: true});
@@ -490,7 +681,7 @@ function syncAndNotify() {
           "type": "header",
           "text": {
             "type": "plain_text",
-            "text": article.title,
+            "text": article.title.substring(0, 150),
             "emoji": true
           }
         },
@@ -525,9 +716,10 @@ function syncAndNotify() {
       
       // e. Slackへの送信
       if (Date.now() - startTime > MAX_SLACK_TIME_MS) {
-        console.warn(`Slack通知送信前に安全閾値（4分30秒）を超過したため、Slack通知をスキップします: ${article.url}`);
+        console.warn(`Slack通知送信前に安全閾値（4分00秒）を超過したため、Slack通知をスキップします: ${article.url}`);
       } else {
         const slackStart = Date.now();
+        console.log(`[Slack送信開始] ${article.url} - 累積経過時間: ${((slackStart - startTime) / 1000).toFixed(1)}s`);
         try {
           UrlFetchApp.fetch(props.SLACK_WEBHOOK_URL, {
             method: 'post',
@@ -557,8 +749,18 @@ function syncAndNotify() {
         console.error("エラー記事の履歴保存に失敗しました: " + article.url, sheetErr);
       }
     } finally {
-      // APIレートリミットおよび短時間バースト防止のため待機
-      Utilities.sleep(2500);
+      // 処理完了（または例外捕捉済）のため Write-Ahead Log を確実にクリア
+      if (scriptProps && typeof scriptProps.deleteProperty === 'function') {
+        try {
+          scriptProps.deleteProperty(IN_PROGRESS_ARTICLE_KEY);
+        } catch (propErr) {
+          console.warn("IN_PROGRESS_ARTICLE の削除に失敗しました: ", propErr);
+        }
+      }
+      // 次の記事が存在し、かつ時間余裕がある場合のみレートリミット対策の待機を行う
+      if (i < newArticles.length - 1 && Date.now() - startTime <= MAX_ARTICLE_START_TIME_MS) {
+        Utilities.sleep(2500);
+      }
     }
   }
   
@@ -677,15 +879,11 @@ function runDiagnostics() {
       const responseCode = pageRes.getResponseCode();
       console.log("HTTPステータスコード: " + responseCode);
       if (responseCode === 200) {
-        let html = pageRes.getContentText();
-        console.log("元HTML文字数: " + html.length + "文字");
+        const rawHtml = pageRes.getContentText();
+        console.log("元HTML文字数: " + rawHtml.length + "文字");
         
-        // クレンジング処理
-        html = html.replace(/<script[\s\S]*?<\/script>/gi, ' ');
-        html = html.replace(/<style[\s\S]*?<\/style>/gi, ' ');
-        html = html.replace(/<[^>]+>/g, ' ');
-        html = html.replace(/\s+/g, ' ').trim();
-        textContent = html.substring(0, 8000);
+        // クレンジング処理（本番と同一の安全ロジック）
+        textContent = extractPlainTextFromHtml(rawHtml);
         console.log("クレンジング後文字数: " + textContent.length + "文字");
         if (textContent.length > 0) {
           console.log("テキストサンプル: " + textContent.substring(0, 150) + "...");
@@ -757,6 +955,16 @@ function runDiagnostics() {
 // Jest テスト用エクスポート (GAS本番環境では無視される)
 // ----------------------------------------------------
 if (typeof module !== 'undefined') {
-  module.exports = { getProperties, doGet, checkToken, runCron, getAvailableGeminiModels, syncAndNotify, runDiagnostics };
+  module.exports = {
+    getProperties,
+    doGet,
+    checkToken,
+    runCron,
+    getAvailableGeminiModels,
+    extractPlainTextFromHtml,
+    isHtmlOrTextContentType,
+    syncAndNotify,
+    runDiagnostics
+  };
 }
 
