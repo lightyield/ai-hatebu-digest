@@ -12,10 +12,16 @@ const mockProps = {
   HATENA_RSS_URL: 'https://b.hatena.ne.jp/hotentry/it.rss',
 };
 
+let mockPropStore = { ...mockProps };
+const mockScriptProperties = {
+  getProperties: jest.fn(() => ({ ...mockPropStore })),
+  getProperty: jest.fn((key) => (key in mockPropStore ? mockPropStore[key] : null)),
+  setProperty: jest.fn((key, val) => { mockPropStore[key] = String(val); }),
+  deleteProperty: jest.fn((key) => { delete mockPropStore[key]; }),
+};
+
 global.PropertiesService = {
-  getScriptProperties: jest.fn(() => ({
-    getProperties: jest.fn(() => ({ ...mockProps })),
-  })),
+  getScriptProperties: jest.fn(() => mockScriptProperties),
 };
 
 /** ContentService モック */
@@ -76,6 +82,8 @@ const {
   doGet,
   runCron,
   getAvailableGeminiModels,
+  extractPlainTextFromHtml,
+  isHtmlOrTextContentType,
   syncAndNotify,
 } = require('./Code');
 
@@ -87,9 +95,12 @@ beforeEach(() => {
   jest.clearAllMocks();
 
   // PropertiesService のデフォルトモックをリセット
-  global.PropertiesService.getScriptProperties.mockReturnValue({
-    getProperties: jest.fn(() => ({ ...mockProps })),
-  });
+  mockPropStore = { ...mockProps };
+  mockScriptProperties.getProperties.mockImplementation(() => ({ ...mockPropStore }));
+  mockScriptProperties.getProperty.mockImplementation((key) => (key in mockPropStore ? mockPropStore[key] : null));
+  mockScriptProperties.setProperty.mockImplementation((key, val) => { mockPropStore[key] = String(val); });
+  mockScriptProperties.deleteProperty.mockImplementation((key) => { delete mockPropStore[key]; });
+  global.PropertiesService.getScriptProperties.mockReturnValue(mockScriptProperties);
 
   // ContentService のデフォルトモックをリセット
   global.ContentService.createTextOutput.mockReturnValue(mockTextOutput);
@@ -1009,7 +1020,7 @@ describe('syncAndNotify()', () => {
     expect(geminiUrlsCalled[2]).toContain('gemini-2.5-flash-lite:generateContent'); // 2件目は最初からliteを呼び出す
   });
 
-  it('処理時間が2分30秒（150秒）を超過した場合、残りの記事の処理を安全に中断して正常終了する', () => {
+  it('処理時間が2分00秒（120秒）を超過した場合、残りの記事の処理を安全に中断して正常終了する', () => {
     const articles = [
       { url: 'https://example.com/article1', title: '記事1' },
       { url: 'https://example.com/article2', title: '記事2' },
@@ -1021,7 +1032,7 @@ describe('syncAndNotify()', () => {
     let currentTime = 1000;
     jest.spyOn(Date, 'now').mockImplementation(() => currentTime);
     mockSheet.insertRowBefore.mockImplementation(() => {
-      currentTime = 155000; // 1件目保存完了後に155秒経過（> 150秒）へ進める
+      currentTime = 125000; // 1件目保存完了後に125秒経過（> 120秒）へ進める
     });
 
     try {
@@ -1033,7 +1044,7 @@ describe('syncAndNotify()', () => {
     }
   });
 
-  it('Gemini APIのリトライ・フォールバック中に3分20秒（200秒）を超過した場合、直ちに要約試行を打ち切って記事処理を完了させる', () => {
+  it('Gemini APIのリトライ・フォールバック中に2分40秒（160秒）を超過した場合、直ちに要約試行を打ち切って記事処理を完了させる', () => {
     const articles = [
       { url: 'https://example.com/article1', title: '記事1' },
     ];
@@ -1069,7 +1080,7 @@ describe('syncAndNotify()', () => {
       }
       if (url.includes(':generateContent')) {
         geminiCallCount++;
-        currentTime = 205000; // 1回目の503レスポンス後に205秒経過（> 200秒）へ進める
+        currentTime = 165000; // 1回目の503レスポンス後に165秒経過（> 160秒）へ進める
         return {
           getContentText: jest.fn(() => '{"error":{"code":503,"message":"unavailable"}}'),
           getResponseCode: jest.fn(() => 503),
@@ -1102,7 +1113,7 @@ describe('syncAndNotify()', () => {
     }
   });
 
-  it('スクレイピング前に3分00秒（180秒）を超過した場合、本文取得をスキップして要約スキップ通知を送る', () => {
+  it('スクレイピング前に2分20秒（140秒）を超過した場合、本文取得をスキップして要約スキップ通知を送る', () => {
     const articles = [
       { url: 'https://example.com/article1', title: '記事1' },
     ];
@@ -1113,10 +1124,10 @@ describe('syncAndNotify()', () => {
     let passedLoopCheck = false;
     jest.spyOn(Date, 'now').mockImplementation(() => {
       if (passedLoopCheck) {
-        return 185000; // スクレイピング判定以降は185秒経過（> 180秒）
+        return 145000; // スクレイピング判定以降は145秒経過（> 140秒）
       }
-      if (currentTime === 140000) {
-        passedLoopCheck = true; // 記事ループ先頭チェックを通過
+      if (currentTime === 110000) {
+        passedLoopCheck = true; // 記事ループ先頭チェック（120秒）を通過
       }
       return currentTime;
     });
@@ -1129,8 +1140,8 @@ describe('syncAndNotify()', () => {
         };
       }
       if (url.includes('models?key=')) {
-        // モデル一覧取得後に時刻を140秒へ進める（記事ループ先頭の150秒判定は通過する）
-        currentTime = 140000;
+        // モデル一覧取得後に時刻を110秒へ進める（記事ループ先頭の120秒判定は通過する）
+        currentTime = 110000;
         return {
           getContentText: jest.fn(() => JSON.stringify({
             models: [{ name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] }]
@@ -1167,7 +1178,7 @@ describe('syncAndNotify()', () => {
     }
   });
 
-  it('はてなブコメ取得前に4分00秒（240秒）を超過した場合、ブコメAPIのfetchをスキップする', () => {
+  it('はてなブコメ取得前に3分30秒（210秒）を超過した場合、ブコメAPIのfetchをスキップする', () => {
     const articles = [
       { url: 'https://example.com/article1', title: '記事1' },
     ];
@@ -1199,8 +1210,8 @@ describe('syncAndNotify()', () => {
         };
       }
       if (url.includes(':generateContent')) {
-        // Gemini成功後に時刻を245秒（> 240秒）へ進める
-        currentTime = 245000;
+        // Gemini成功後に時刻を215秒（> 210秒、かつ <= 240秒）へ進める
+        currentTime = 215000;
         return {
           getContentText: jest.fn(() => JSON.stringify({
             candidates: [{ content: { parts: [{ text: '要約テスト' }] } }]
@@ -1237,7 +1248,7 @@ describe('syncAndNotify()', () => {
     }
   });
 
-  it('Slack通知送信前に4分30秒（270秒）を超過した場合、Slack通知のfetchをスキップしスプレッドシートに保存する', () => {
+  it('Slack通知送信前に4分00秒（240秒）を超過した場合、Slack通知のfetchをスキップしスプレッドシートに保存する', () => {
     const articles = [
       { url: 'https://example.com/article1', title: '記事1' },
     ];
@@ -1276,8 +1287,8 @@ describe('syncAndNotify()', () => {
         };
       }
       if (url.includes('b.hatena.ne.jp/entry/jsonlite')) {
-        // ブコメ取得後に275秒（> 270秒）へ進める
-        currentTime = 275000;
+        // ブコメ取得後に245秒（> 240秒）へ進める
+        currentTime = 245000;
         return {
           getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
           getResponseCode: jest.fn(() => 200),
@@ -1330,6 +1341,195 @@ describe('syncAndNotify()', () => {
     // catchブロック内の再試行ループ防止処理により、setValueが2回（失敗した通常保存＋フォールバック保存）呼ばれる
     expect(setValueCalls).toBe(2);
     expect(mockSheet.insertRowBefore).toHaveBeenCalledWith(1);
+  });
+
+  it('前回実行が記事処理中に強制終了（IN_PROGRESS_ARTICLE残存）していた場合、該当URLを自動スキップ登録してSlack通知し、後続記事を処理する', () => {
+    const crashedArticle = { url: 'https://example.com/crashed-article', title: 'タイムアウト原因記事' };
+    const nextArticle = { url: 'https://example.com/next-article', title: '次の正常記事' };
+    mockPropStore.IN_PROGRESS_ARTICLE = JSON.stringify({
+      url: crashedArticle.url,
+      title: crashedArticle.title,
+      startedAt: '2026-11-20T11:18:00.000Z',
+    });
+
+    const articles = [crashedArticle, nextArticle];
+    setupXmlServiceMock(articles);
+    setupFetchMocksForArticles([nextArticle]);
+
+    const savedUrls = [];
+    mockSheet.getRange.mockImplementation(() => ({
+      getValues: jest.fn(() => []),
+      setValue: jest.fn((val) => savedUrls.push(val)),
+    }));
+
+    const count = syncAndNotify();
+    // 正常記事1件のみが処理カウントされる
+    expect(count).toBe(1);
+    // クラッシュ記事が先に履歴登録され、その後正常記事も履歴登録される
+    expect(savedUrls).toEqual([crashedArticle.url, nextArticle.url]);
+    // クラッシュ記事のURLはスクレイピングされない
+    const crashedFetchCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === crashedArticle.url);
+    expect(crashedFetchCalls.length).toBe(0);
+    // Slack通知はクラッシュ自動復旧警告 + 正常記事通知 の計2件
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(2);
+    const recoveryPayload = JSON.parse(slackCalls[0][1].payload);
+    expect(recoveryPayload.blocks[3].text.text).toContain('タイムアウトからの自動復旧');
+    // IN_PROGRESS_ARTICLE はクリーンアップされている
+    expect(mockPropStore.IN_PROGRESS_ARTICLE).toBeUndefined();
+  });
+
+  it('記事のContent-TypeがPDFなど非テキストの場合、getContentTextを呼ばずに要約スキップして履歴保存する', () => {
+    const articles = [
+      { url: 'https://example.com/paper.pdf', title: 'PDF論文記事' },
+    ];
+    setupXmlServiceMock(articles);
+
+    const pdfGetContentText = jest.fn(() => '%PDF-1.7 binary...');
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [{ name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getHeaders: jest.fn(() => ({ 'Content-Type': 'application/pdf' })),
+          getContentText: pdfGetContentText,
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(1);
+    // 非テキストコンテンツのため getContentText() は呼ばれない
+    expect(pdfGetContentText).not.toHaveBeenCalled();
+
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(1);
+    const payload = JSON.parse(slackCalls[0][1].payload);
+    expect(payload.blocks[3].text.text).toContain('HTML/テキスト以外のコンテンツ');
+    expect(payload.blocks[3].text.text).toContain('application/pdf');
+  });
+
+  it('Gemini APIの503応答に15秒以上かかった場合、同一モデルを再試行せず即座に次候補モデルへフォールバックする', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '遅延テスト記事' },
+    ];
+    setupXmlServiceMock(articles);
+
+    let currentTime = 1000;
+    const geminiModelsCalled = [];
+    jest.spyOn(Date, 'now').mockImplementation(() => currentTime);
+
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [
+              { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+            ]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        if (url.includes('gemini-2.5-flash:generateContent')) {
+          geminiModelsCalled.push('gemini-2.5-flash');
+          currentTime += 20000; // 20秒（>= 15秒）かかって503を返す
+          return {
+            getContentText: jest.fn(() => '{"error":{"code":503,"message":"overloaded"}}'),
+            getResponseCode: jest.fn(() => 503),
+          };
+        }
+        geminiModelsCalled.push('gemini-2.5-flash-lite');
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            candidates: [{ content: { parts: [{ text: 'Liteで高速要約成功' }] } }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    try {
+      const count = syncAndNotify();
+      expect(count).toBe(1);
+      // 1回目の遅延503の後、同一モデル(gemini-2.5-flash)を再試行せず即座にliteへフォールバックする
+      expect(geminiModelsCalled).toEqual(['gemini-2.5-flash', 'gemini-2.5-flash-lite']);
+    } finally {
+      Date.now.mockRestore();
+    }
+  });
+});
+
+// ------------------------------------------------------------
+// extractPlainTextFromHtml / isHtmlOrTextContentType
+// ------------------------------------------------------------
+describe('extractPlainTextFromHtml() & isHtmlOrTextContentType()', () => {
+  it('script / style / noscript タグおよびHTMLタグを除去してプレーンテキストを返す', () => {
+    const html = '<html><head><style>body{color:red;}</style><script>const x = 1;</script></head><body><h1>タイトル</h1><noscript>JS無効</noscript><p>本文テキストです。</p></body></html>';
+    const text = extractPlainTextFromHtml(html);
+    expect(text).toBe('タイトル 本文テキストです。');
+  });
+
+  it('閉じタグのない不正なscriptタグや巨大HTMLでもバックトラッキングせず安全に上限文字数で切り詰める', () => {
+    const hugeBody = '<p>' + 'あ'.repeat(10000) + '</p>';
+    const malformedHtml = hugeBody + '<script>' + 'var a = 1;'.repeat(30000); // 閉じタグなし・300KB超
+    const start = Date.now();
+    const text = extractPlainTextFromHtml(malformedHtml);
+    const elapsed = Date.now() - start;
+
+    expect(text.length).toBe(6000);
+    expect(text).not.toContain('var a');
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it('Content-Type がHTML/テキスト系かどうかを正しく判定する', () => {
+    expect(isHtmlOrTextContentType('text/html; charset=utf-8')).toBe(true);
+    expect(isHtmlOrTextContentType('text/plain')).toBe(true);
+    expect(isHtmlOrTextContentType('application/xhtml+xml')).toBe(true);
+    expect(isHtmlOrTextContentType('')).toBe(true);
+    expect(isHtmlOrTextContentType('application/pdf')).toBe(false);
+    expect(isHtmlOrTextContentType('image/png')).toBe(false);
+    expect(isHtmlOrTextContentType('application/octet-stream')).toBe(false);
   });
 });
 
