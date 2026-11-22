@@ -47,7 +47,7 @@ function runCron() {
  * @returns {string[]} 利用可能なモデル名（ID）のリスト
  */
 function getAvailableGeminiModels(apiKey) {
-  const DEFAULT_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+  const DEFAULT_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash'];
   const MAX_CANDIDATE_MODELS = 3;
   if (!apiKey) return DEFAULT_MODELS;
 
@@ -100,11 +100,11 @@ function getAvailableGeminiModels(apiKey) {
       if (numA !== numB) {
         return numB - numA; // 降順
       }
-      // -lite は標準版の後に配置
+      // -lite は高速・過負荷耐性が高いため同一バージョン内では標準版より先に配置
       const isLiteA = a.includes('lite');
       const isLiteB = b.includes('lite');
       if (isLiteA !== isLiteB) {
-        return isLiteA ? 1 : -1;
+        return isLiteA ? -1 : 1;
       }
       return a.localeCompare(b);
     };
@@ -115,20 +115,21 @@ function getAvailableGeminiModels(apiKey) {
     const pool = flashModels.length > 0 ? flashModels : otherModels;
     if (pool.length === 0) return DEFAULT_MODELS;
 
-    // 特性分散型の候補選定（最新標準モデル、最新Liteモデル、最も成熟した標準モデル）
+    // 特性分散型の候補選定（最新Liteモデル、最新標準モデル、最も成熟した標準モデル）
+    // GASの6分制限下でのハング・遅延を防ぐため、軽量・高速なLite系を最優先とする
     const liteModels = pool.filter(m => m.toLowerCase().includes('lite'));
     const standardModels = pool.filter(m => !m.toLowerCase().includes('lite'));
 
     const selected = [];
 
-    // ① 最新の標準Flashモデル（先頭）
-    if (standardModels.length > 0) {
-      selected.push(standardModels[0]);
+    // ① 最新の軽量Liteモデル（先頭）- 高速かつ過負荷耐性が高い
+    if (liteModels.length > 0) {
+      selected.push(liteModels[0]);
     }
 
-    // ② 最新の軽量Liteモデル（先頭）- 軽量・別クラスタで過負荷耐性が高い
-    if (liteModels.length > 0 && !selected.includes(liteModels[0])) {
-      selected.push(liteModels[0]);
+    // ② 最新の標準Flashモデル - Lite系が利用不可・過負荷時のフォールバック先
+    if (standardModels.length > 0 && !selected.includes(standardModels[0])) {
+      selected.push(standardModels[0]);
     }
 
     // ③ 最も成熟した標準Flashモデル（末尾）- インフラが確立しており安定稼働
@@ -378,10 +379,12 @@ function syncAndNotify() {
   
   if (newArticles.length === 0) return 0; // 新着記事なし
   
-  // 4. 動的モデル一覧の取得 (上位最大3件: 最新標準、最新Lite、成熟下位標準)
+  // 4. 動的モデル一覧の取得 (上位最大3件: 最新Lite、最新標準、成熟下位標準)
   const MODEL_LIST = getAvailableGeminiModels(props.GEMINI_API_KEY);
   let activeModelList = [...MODEL_LIST];
   let geminiFatalError = false;
+  // thinkingConfig 非対応・設定不可が判明したモデルを記録（2件目以降での無駄な400リトライ防止）
+  const modelsWithoutThinkingConfig = {};
 
   // 5. 各記事の処理
   let processedCount = 0;
@@ -517,14 +520,9 @@ function syncAndNotify() {
         console.log(`[Gemini要約開始] 候補モデル: ${JSON.stringify(activeModelList)} - 累積経過時間: ${((geminiStart - startTime) / 1000).toFixed(1)}s`);
         let successfulModel = null;
         try {
-          const payload = {
-            contents: [{
-              parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
-            }],
-            generationConfig: {
-              maxOutputTokens: 2048
-            }
-          };
+          const baseContents = [{
+            parts: [{ text: `以下の記事本文を日本語で要約してください。\n\n${textContent}` }]
+          }];
           
           let succeeded = false;
           let geminiTimeExceeded = false;
@@ -543,6 +541,14 @@ function syncAndNotify() {
                 break;
               }
               const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${props.GEMINI_API_KEY}`;
+              const useThinkingConfig = !modelsWithoutThinkingConfig[currentModel];
+              const generationConfig = useThinkingConfig
+                ? { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } }
+                : { maxOutputTokens: 2048 };
+              const payload = {
+                contents: baseContents,
+                generationConfig: generationConfig
+              };
               const attemptStart = Date.now();
               try {
                 const geminiRes = UrlFetchApp.fetch(geminiUrl, {
@@ -593,8 +599,15 @@ function syncAndNotify() {
                   shouldFallback = true;
                   break;
                 } else if (responseCode === 400) {
+                  const errBody = geminiRes.getContentText() || '';
+                  if (useThinkingConfig && errBody.toLowerCase().includes('thinking')) {
+                    // thinkingConfig 非対応・設定不可モデルの場合は thinkingConfig を除外して即時再試行
+                    console.warn(`モデル ${currentModel} で thinkingConfig が非対応のため除外して再試行します (${responseCode}): `, errBody);
+                    modelsWithoutThinkingConfig[currentModel] = true;
+                    continue;
+                  }
                   // 不正なリクエスト / APIキー不正等
-                  console.warn(`Gemini API リクエストエラー (${responseCode}): `, geminiRes.getContentText());
+                  console.warn(`Gemini API リクエストエラー (${responseCode}): `, errBody);
                   geminiFatalError = true;
                   break;
                 } else {
