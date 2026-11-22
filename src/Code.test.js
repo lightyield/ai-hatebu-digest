@@ -245,7 +245,7 @@ describe('runCron()', () => {
 describe('getAvailableGeminiModels()', () => {
   it('APIキーが未指定の場合、デフォルトモデルリストを返す', () => {
     const models = getAvailableGeminiModels('');
-    expect(models).toEqual(['gemini-2.5-flash', 'gemini-2.5-flash-lite']);
+    expect(models).toEqual(['gemini-2.5-flash-lite', 'gemini-2.5-flash']);
   });
 
   it('models.list APIから正常にモデル一覧を取得し、適切にフィルタ・ソートして最大3件に絞り込む', () => {
@@ -268,14 +268,14 @@ describe('getAvailableGeminiModels()', () => {
 
     const result = getAvailableGeminiModels('test-key');
 
-    // 特性分散型により、最新標準、最新Lite、最も成熟した標準モデルが選定される
+    // 特性分散型により、最新Lite、最新標準、最も成熟した標準モデルが選定される
     expect(result.length).toBe(3);
-    expect(result[0]).toBe('gemini-3.5-flash');
-    expect(result[1]).toBe('gemini-2.5-flash-lite');
+    expect(result[0]).toBe('gemini-2.5-flash-lite');
+    expect(result[1]).toBe('gemini-3.5-flash');
     expect(result[2]).toBe('gemini-2.5-flash');
   });
 
-  it('多数のFlashモデルが存在する場合、最新標準・最新Lite・成熟下位標準を自動選出する', () => {
+  it('多数のFlashモデルが存在する場合、最新Lite・最新標準・成熟下位標準を自動選出する', () => {
     const mockApiResponse = {
       models: [
         { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
@@ -296,8 +296,8 @@ describe('getAvailableGeminiModels()', () => {
     const result = getAvailableGeminiModels('test-key');
 
     expect(result).toEqual([
-      'gemini-3.8-flash',      // ① 最新の標準Flash
-      'gemini-3.5-flash-lite', // ② 最新のLite
+      'gemini-3.5-flash-lite', // ① 最新のLite（高速・過負荷耐性優先）
+      'gemini-3.8-flash',      // ② 最新の標準Flash
       'gemini-2.5-flash',      // ③ 最も成熟した標準Flash
     ]);
   });
@@ -309,7 +309,7 @@ describe('getAvailableGeminiModels()', () => {
     });
 
     const result = getAvailableGeminiModels('test-key');
-    expect(result).toEqual(['gemini-2.5-flash', 'gemini-2.5-flash-lite']);
+    expect(result).toEqual(['gemini-2.5-flash-lite', 'gemini-2.5-flash']);
   });
 
   it('models.list API呼び出しで例外が発生した場合、デフォルトモデルリストを返す', () => {
@@ -318,7 +318,7 @@ describe('getAvailableGeminiModels()', () => {
     });
 
     const result = getAvailableGeminiModels('test-key');
-    expect(result).toEqual(['gemini-2.5-flash', 'gemini-2.5-flash-lite']);
+    expect(result).toEqual(['gemini-2.5-flash-lite', 'gemini-2.5-flash']);
   });
 });
 
@@ -983,8 +983,8 @@ describe('syncAndNotify()', () => {
       }
       if (url.includes(':generateContent')) {
         geminiUrlsCalled.push(url);
-        // gemini-2.5-flash は 404 で失敗し、gemini-2.5-flash-lite は 200 で成功する
-        if (url.includes('gemini-2.5-flash:generateContent')) {
+        // 第1候補 gemini-2.5-flash-lite は 404 で失敗し、第2候補 gemini-2.5-flash は 200 で成功する
+        if (url.includes('gemini-2.5-flash-lite:generateContent')) {
           return {
             getContentText: jest.fn(() => '{"error":"model not found"}'),
             getResponseCode: jest.fn(() => 404),
@@ -992,7 +992,7 @@ describe('syncAndNotify()', () => {
         }
         return {
           getContentText: jest.fn(() => JSON.stringify({
-            candidates: [{ content: { parts: [{ text: 'Liteでの要約' }] } }]
+            candidates: [{ content: { parts: [{ text: '標準モデルでの要約' }] } }]
           })),
           getResponseCode: jest.fn(() => 200),
         };
@@ -1012,12 +1012,12 @@ describe('syncAndNotify()', () => {
     const count = syncAndNotify();
     expect(count).toBe(2);
 
-    // 1件目: gemini-2.5-flash (404) -> gemini-2.5-flash-lite (200成功)
-    // 2件目: 直前で成功した gemini-2.5-flash-lite が先頭に昇格して最優先で呼ばれる
+    // 1件目: gemini-2.5-flash-lite (404) -> gemini-2.5-flash (200成功)
+    // 2件目: 直前で成功した gemini-2.5-flash が先頭に昇格して最優先で呼ばれる
     expect(geminiUrlsCalled.length).toBe(3);
-    expect(geminiUrlsCalled[0]).toContain('gemini-2.5-flash:generateContent');
-    expect(geminiUrlsCalled[1]).toContain('gemini-2.5-flash-lite:generateContent');
-    expect(geminiUrlsCalled[2]).toContain('gemini-2.5-flash-lite:generateContent'); // 2件目は最初からliteを呼び出す
+    expect(geminiUrlsCalled[0]).toContain('gemini-2.5-flash-lite:generateContent');
+    expect(geminiUrlsCalled[1]).toContain('gemini-2.5-flash:generateContent');
+    expect(geminiUrlsCalled[2]).toContain('gemini-2.5-flash:generateContent'); // 2件目は最初から標準モデルを呼び出す
   });
 
   it('処理時間が2分00秒（120秒）を超過した場合、残りの記事の処理を安全に中断して正常終了する', () => {
@@ -1461,18 +1461,18 @@ describe('syncAndNotify()', () => {
         };
       }
       if (url.includes(':generateContent')) {
-        if (url.includes('gemini-2.5-flash:generateContent')) {
-          geminiModelsCalled.push('gemini-2.5-flash');
+        if (url.includes('gemini-2.5-flash-lite:generateContent')) {
+          geminiModelsCalled.push('gemini-2.5-flash-lite');
           currentTime += 20000; // 20秒（>= 15秒）かかって503を返す
           return {
             getContentText: jest.fn(() => '{"error":{"code":503,"message":"overloaded"}}'),
             getResponseCode: jest.fn(() => 503),
           };
         }
-        geminiModelsCalled.push('gemini-2.5-flash-lite');
+        geminiModelsCalled.push('gemini-2.5-flash');
         return {
           getContentText: jest.fn(() => JSON.stringify({
-            candidates: [{ content: { parts: [{ text: 'Liteで高速要約成功' }] } }]
+            candidates: [{ content: { parts: [{ text: 'フォールバックモデルで高速要約成功' }] } }]
           })),
           getResponseCode: jest.fn(() => 200),
         };
@@ -1492,11 +1492,87 @@ describe('syncAndNotify()', () => {
     try {
       const count = syncAndNotify();
       expect(count).toBe(1);
-      // 1回目の遅延503の後、同一モデル(gemini-2.5-flash)を再試行せず即座にliteへフォールバックする
-      expect(geminiModelsCalled).toEqual(['gemini-2.5-flash', 'gemini-2.5-flash-lite']);
+      // 1回目の遅延503の後、同一モデル(gemini-2.5-flash-lite)を再試行せず即座に次候補(gemini-2.5-flash)へフォールバックする
+      expect(geminiModelsCalled).toEqual(['gemini-2.5-flash-lite', 'gemini-2.5-flash']);
     } finally {
       Date.now.mockRestore();
     }
+  });
+
+  it('Gemini APIリクエストに thinkingBudget: 0 が含まれ、thinking非対応の400エラー時はthinkingConfigを除外して再試行し2件目以降も除外する', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+      { url: 'https://example.com/article2', title: '記事2' },
+    ];
+    setupXmlServiceMock(articles);
+
+    const geminiPayloads = [];
+    global.UrlFetchApp.fetch.mockImplementation((url, options) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [
+              { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+            ]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url || url === articles[1].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        const parsed = JSON.parse(options.payload);
+        geminiPayloads.push(parsed);
+        // thinkingConfig が含まれている場合は非対応エラー(400)を返す
+        if (parsed.generationConfig && parsed.generationConfig.thinkingConfig) {
+          return {
+            getContentText: jest.fn(() => '{"error":{"code":400,"message":"Thinking is not supported by this model."}}'),
+            getResponseCode: jest.fn(() => 400),
+          };
+        }
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            candidates: [{ content: { parts: [{ text: 'thinkingConfig除外で要約成功' }] } }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(2);
+    // 1回目(記事1): thinkingBudget: 0 付きで400
+    // 2回目(記事1再試行): thinkingConfig 除外で200成功
+    // 3回目(記事2): 記憶済のため最初から thinkingConfig なしで200成功
+    expect(geminiPayloads.length).toBe(3);
+    expect(geminiPayloads[0].generationConfig.thinkingConfig).toEqual({ thinkingBudget: 0 });
+    expect(geminiPayloads[1].generationConfig.thinkingConfig).toBeUndefined();
+    expect(geminiPayloads[2].generationConfig.thinkingConfig).toBeUndefined();
+
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(2);
+    expect(JSON.parse(slackCalls[0][1].payload).blocks[3].text.text).toContain('thinkingConfig除外で要約成功');
+    expect(JSON.parse(slackCalls[1][1].payload).blocks[3].text.text).toContain('thinkingConfig除外で要約成功');
   });
 });
 
