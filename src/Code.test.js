@@ -82,6 +82,8 @@ const {
   doGet,
   runCron,
   getAvailableGeminiModels,
+  supportsThinkingBudgetZero,
+  isGeminiAuthOrKeyError,
   extractPlainTextFromHtml,
   isHtmlOrTextContentType,
   syncAndNotify,
@@ -795,8 +797,9 @@ describe('syncAndNotify()', () => {
 
     const count = syncAndNotify();
     expect(count).toBe(2);
-    // 最初の記事で400エラー検知時に即座にサーキットブレーカー作動。フォールバックや2つ目の記事でのgenerateContentは呼ばれない
-    expect(geminiCallCount).toBe(1);
+    // 2.5系2モデルそれぞれで thinkingConfig あり→なしの計4回試行後に全モデル400失敗でサーキットブレーカー作動。
+    // 2件目の記事での generateContent は一切呼ばれない
+    expect(geminiCallCount).toBe(4);
 
     // 2件目の記事は「Gemini APIが一時的に利用不可のため〜」という要約になることを検証
     const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
@@ -1573,6 +1576,300 @@ describe('syncAndNotify()', () => {
     expect(slackCalls.length).toBe(2);
     expect(JSON.parse(slackCalls[0][1].payload).blocks[3].text.text).toContain('thinkingConfig除外で要約成功');
     expect(JSON.parse(slackCalls[1][1].payload).blocks[3].text.text).toContain('thinkingConfig除外で要約成功');
+  });
+
+  it('Gemini 3.x系など2.5系以外のモデルでは最初から thinkingConfig を付与せずにリクエストする', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+    ];
+    setupXmlServiceMock(articles);
+
+    const geminiPayloads = [];
+    global.UrlFetchApp.fetch.mockImplementation((url, options) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [
+              { name: 'models/gemini-3.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-3.8-flash', supportedGenerationMethods: ['generateContent'] },
+            ]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        const parsed = JSON.parse(options.payload);
+        geminiPayloads.push(parsed);
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            candidates: [{ content: { parts: [{ text: '3.5-flash-liteで1発成功' }] } }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(1);
+    expect(geminiPayloads.length).toBe(1);
+    expect(geminiPayloads[0].generationConfig.thinkingConfig).toBeUndefined();
+    expect(geminiPayloads[0].generationConfig.maxOutputTokens).toBe(2048);
+
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(1);
+    expect(JSON.parse(slackCalls[0][1].payload).blocks[3].text.text).toContain('3.5-flash-liteで1発成功');
+  });
+
+  it('2.5系モデルでエラー文言に"thinking"を含まない汎用HTTP 400 (INVALID_ARGUMENT) が返っても thinkingConfig を除外して再試行し成功する', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+    ];
+    setupXmlServiceMock(articles);
+
+    const geminiPayloads = [];
+    global.UrlFetchApp.fetch.mockImplementation((url, options) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [
+              { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+            ]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        const parsed = JSON.parse(options.payload);
+        geminiPayloads.push(parsed);
+        if (parsed.generationConfig && parsed.generationConfig.thinkingConfig) {
+          // "thinking" を一切含まない汎用的な INVALID_ARGUMENT レスポンス
+          return {
+            getContentText: jest.fn(() => JSON.stringify({
+              error: { code: 400, message: 'Request contains an invalid argument.', status: 'INVALID_ARGUMENT' }
+            })),
+            getResponseCode: jest.fn(() => 400),
+          };
+        }
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            candidates: [{ content: { parts: [{ text: '汎用400から除外再試行で成功' }] } }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(1);
+    expect(geminiPayloads.length).toBe(2);
+    expect(geminiPayloads[0].generationConfig.thinkingConfig).toEqual({ thinkingBudget: 0 });
+    expect(geminiPayloads[1].generationConfig.thinkingConfig).toBeUndefined();
+
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(1);
+    expect(JSON.parse(slackCalls[0][1].payload).blocks[3].text.text).toContain('汎用400から除外再試行で成功');
+  });
+
+  it('先頭モデルが thinkingConfig なしでも HTTP 400 を返した場合、次候補モデルへフォールバックして要約に成功する', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+    ];
+    setupXmlServiceMock(articles);
+
+    const triedModels = [];
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [
+              { name: 'models/gemini-3.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-3.8-flash', supportedGenerationMethods: ['generateContent'] },
+            ]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        const match = url.match(/models\/([^:]+):generateContent/);
+        const model = match ? match[1] : '';
+        triedModels.push(model);
+        if (model === 'gemini-3.5-flash-lite') {
+          return {
+            getContentText: jest.fn(() => JSON.stringify({
+              error: { code: 400, message: 'Request contains an invalid argument.', status: 'INVALID_ARGUMENT' }
+            })),
+            getResponseCode: jest.fn(() => 400),
+          };
+        }
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            candidates: [{ content: { parts: [{ text: '次候補モデルへの400フォールバックで成功' }] } }]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(1);
+    expect(triedModels).toEqual(['gemini-3.5-flash-lite', 'gemini-3.8-flash']);
+
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(1);
+    expect(JSON.parse(slackCalls[0][1].payload).blocks[3].text.text).toContain('次候補モデルへの400フォールバックで成功');
+  });
+
+  it('APIキー不正（API_KEY_INVALID）の HTTP 400 エラー時は再試行やフォールバックせず即座にサーキットブレーカーを作動させる', () => {
+    const articles = [
+      { url: 'https://example.com/article1', title: '記事1' },
+      { url: 'https://example.com/article2', title: '記事2' },
+    ];
+    setupXmlServiceMock(articles);
+
+    let geminiCallCount = 0;
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url === mockProps.HATENA_RSS_URL) {
+        return {
+          getContentText: jest.fn(() => buildRssXml(articles)),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes('models?key=')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            models: [
+              { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+              { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
+            ]
+          })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url === articles[0].url || url === articles[1].url) {
+        return {
+          getContentText: jest.fn(() => '<html><body>' + '十分な長さの記事本文。'.repeat(30) + '</body></html>'),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      if (url.includes(':generateContent')) {
+        geminiCallCount++;
+        return {
+          getContentText: jest.fn(() => JSON.stringify({
+            error: { code: 400, message: 'API key not valid. Please pass a valid API key.', status: 'INVALID_ARGUMENT', details: [{ reason: 'API_KEY_INVALID' }] }
+          })),
+          getResponseCode: jest.fn(() => 400),
+        };
+      }
+      if (url.includes('b.hatena.ne.jp')) {
+        return {
+          getContentText: jest.fn(() => JSON.stringify({ bookmarks: [] })),
+          getResponseCode: jest.fn(() => 200),
+        };
+      }
+      return {
+        getContentText: jest.fn(() => 'ok'),
+        getResponseCode: jest.fn(() => 200),
+      };
+    });
+
+    const count = syncAndNotify();
+    expect(count).toBe(2);
+    expect(geminiCallCount).toBe(1);
+
+    const slackCalls = global.UrlFetchApp.fetch.mock.calls.filter(call => call[0] === mockProps.SLACK_WEBHOOK_URL);
+    expect(slackCalls.length).toBe(2);
+    expect(JSON.parse(slackCalls[1][1].payload).blocks[3].text.text).toContain('Gemini APIが一時的に利用不可');
+  });
+});
+
+// ------------------------------------------------------------
+// supportsThinkingBudgetZero / isGeminiAuthOrKeyError
+// ------------------------------------------------------------
+describe('supportsThinkingBudgetZero() & isGeminiAuthOrKeyError()', () => {
+  it('gemini-2.5系モデルのみ thinkingBudget: 0 の対象と判定する', () => {
+    expect(supportsThinkingBudgetZero('gemini-2.5-flash-lite')).toBe(true);
+    expect(supportsThinkingBudgetZero('gemini-2.5-flash')).toBe(true);
+    expect(supportsThinkingBudgetZero('gemini-2.5-pro')).toBe(true);
+    expect(supportsThinkingBudgetZero('gemini-3.5-flash-lite')).toBe(false);
+    expect(supportsThinkingBudgetZero('gemini-3.8-flash')).toBe(false);
+    expect(supportsThinkingBudgetZero('gemini-omni-1.2-flash')).toBe(false);
+    expect(supportsThinkingBudgetZero('gemini-2.0-flash')).toBe(false);
+    expect(supportsThinkingBudgetZero('')).toBe(false);
+    expect(supportsThinkingBudgetZero(null)).toBe(false);
+  });
+
+  it('APIキー不正や権限エラーのレスポンス本文を正しく判定する', () => {
+    expect(isGeminiAuthOrKeyError('{"error":{"message":"API key not valid."}}')).toBe(true);
+    expect(isGeminiAuthOrKeyError('{"details":[{"reason":"API_KEY_INVALID"}]}')).toBe(true);
+    expect(isGeminiAuthOrKeyError('{"error":{"status":"PERMISSION_DENIED"}}')).toBe(true);
+    expect(isGeminiAuthOrKeyError('{"error":{"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}}')).toBe(false);
+    expect(isGeminiAuthOrKeyError('')).toBe(false);
   });
 });
 

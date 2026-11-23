@@ -166,6 +166,34 @@ function getAvailableGeminiModels(apiKey) {
 const IN_PROGRESS_ARTICLE_KEY = 'IN_PROGRESS_ARTICLE';
 
 /**
+ * thinkingConfig: { thinkingBudget: 0 } を適用する対象モデルかどうかを判定する
+ * Gemini 2.5系では思考トークン抑制に有効だが、3.x系やomni系等では
+ * INVALID_ARGUMENT (HTTP 400) となるケースがあるため2.5系のみに限定する
+ * @param {string} modelName
+ * @returns {boolean}
+ */
+function supportsThinkingBudgetZero(modelName) {
+  if (!modelName || typeof modelName !== 'string') return false;
+  return /^gemini-2\.5-/i.test(modelName);
+}
+
+/**
+ * HTTP 400 レスポンス本文がAPIキー不正など全モデル共通の恒久エラーかどうかを判定する
+ * @param {string} errBody
+ * @returns {boolean}
+ */
+function isGeminiAuthOrKeyError(errBody) {
+  if (!errBody || typeof errBody !== 'string') return false;
+  const lower = errBody.toLowerCase();
+  return (
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('invalid api key') ||
+    lower.includes('permission_denied')
+  );
+}
+
+/**
  * レスポンスヘッダーから大文字小文字を区別せず指定キーの値を取得する
  * @param {Object} headers
  * @param {string} targetName
@@ -526,6 +554,8 @@ function syncAndNotify() {
           
           let succeeded = false;
           let geminiTimeExceeded = false;
+          let had400Failure = false;
+          let allFailedWith400 = true;
           for (let m = 0; m < activeModelList.length; m++) {
             const currentModel = activeModelList[m];
             let attempt = 1;
@@ -541,7 +571,7 @@ function syncAndNotify() {
                 break;
               }
               const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${props.GEMINI_API_KEY}`;
-              const useThinkingConfig = !modelsWithoutThinkingConfig[currentModel];
+              const useThinkingConfig = supportsThinkingBudgetZero(currentModel) && !modelsWithoutThinkingConfig[currentModel];
               const generationConfig = useThinkingConfig
                 ? { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } }
                 : { maxOutputTokens: 2048 };
@@ -590,25 +620,35 @@ function syncAndNotify() {
                     delayMs *= 2;
                     attempt++;
                   } else {
+                    allFailedWith400 = false;
                     shouldFallback = true;
                     break;
                   }
                 } else if (responseCode === 404) {
                   // モデルが存在しない / 廃止された: 次のモデルへフォールバック
                   console.warn(`モデル ${currentModel} が見つかりません (${responseCode}): `, geminiRes.getContentText());
+                  allFailedWith400 = false;
                   shouldFallback = true;
                   break;
                 } else if (responseCode === 400) {
                   const errBody = geminiRes.getContentText() || '';
-                  if (useThinkingConfig && errBody.toLowerCase().includes('thinking')) {
-                    // thinkingConfig 非対応・設定不可モデルの場合は thinkingConfig を除外して即時再試行
-                    console.warn(`モデル ${currentModel} で thinkingConfig が非対応のため除外して再試行します (${responseCode}): `, errBody);
+                  if (isGeminiAuthOrKeyError(errBody)) {
+                    // APIキー不正など全モデル共通の恒久エラーは即座にサーキットブレーカー発動
+                    console.warn(`Gemini API 認証・キーエラー (${responseCode}): `, errBody);
+                    geminiFatalError = true;
+                    break;
+                  }
+                  if (useThinkingConfig) {
+                    // thinkingConfig 付きで 400 が返った場合はエラー文言に依存せず除外して同一モデルで即時再試行
+                    // （APIが汎用的な "Request contains an invalid argument." しか返さないケースに対応）
+                    console.warn(`モデル ${currentModel} で thinkingConfig 付きリクエストが拒否されたため除外して再試行します (${responseCode}): `, errBody);
                     modelsWithoutThinkingConfig[currentModel] = true;
                     continue;
                   }
-                  // 不正なリクエスト / APIキー不正等
-                  console.warn(`Gemini API リクエストエラー (${responseCode}): `, errBody);
-                  geminiFatalError = true;
+                  // thinkingConfig なしでも 400 の場合はモデル固有の非互換の可能性があるため次候補へフォールバック
+                  console.warn(`モデル ${currentModel} でリクエストエラー (${responseCode}): `, errBody);
+                  had400Failure = true;
+                  shouldFallback = true;
                   break;
                 } else {
                   console.warn(`Gemini API 恒常的エラー (${responseCode}): `, geminiRes.getContentText());
@@ -623,6 +663,7 @@ function syncAndNotify() {
                   delayMs *= 2;
                   attempt++;
                 } else {
+                  allFailedWith400 = false;
                   shouldFallback = true;
                   break;
                 }
@@ -636,6 +677,12 @@ function syncAndNotify() {
             if (shouldFallback && m < activeModelList.length - 1) {
               console.warn(`モデル ${currentModel} から次候補モデル ${activeModelList[m + 1]} へフォールバックします。`);
             }
+          }
+
+          // 全候補モデルが 400 エラーで失敗した場合は恒常的リクエスト異常とみなしてサーキットブレーカー発動
+          if (!succeeded && !geminiFatalError && !geminiTimeExceeded && had400Failure && allFailedWith400) {
+            console.warn(`利用可能な全モデルで HTTP 400 エラーが発生したため、サーキットブレーカーを作動させます: ${article.url}`);
+            geminiFatalError = true;
           }
 
           // 成功したモデルがあれば、次回記事で優先利用（先頭に配置）
@@ -974,6 +1021,8 @@ if (typeof module !== 'undefined') {
     checkToken,
     runCron,
     getAvailableGeminiModels,
+    supportsThinkingBudgetZero,
+    isGeminiAuthOrKeyError,
     extractPlainTextFromHtml,
     isHtmlOrTextContentType,
     syncAndNotify,
