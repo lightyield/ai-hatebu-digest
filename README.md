@@ -76,6 +76,10 @@ sequenceDiagram
    - ホスティング & API: Google Apps Script (0円)
    - データベース: Google スプレッドシート (0円)
    - AI要約: Gemini API (Google AI Studio: 0円, 15 RPM)
+6. **GASエラー通知メール監視 & GitHub Issue 自動起票（任意）**:
+   - 別トリガー（`watchGasFailureEmails`）により、Gmail に届く GAS エラー通知メール（`noreply-apps-scripts-notifications@google.com`）を24時間定期監視。
+   - 対象プロジェクトのエラー通知を検知すると、HTMLテーブル（またはプレーンテキスト抜粋）から発生時刻・関数名・エラーメッセージを抽出し、GitHub REST API 経由で自動的に Issue を起票。起票後は Slack へ Issue リンク付きで通知。
+   - 重複起票防止はメッセージIDの永続化（スクリプトプロパティ `REPORTED_GAS_FAILURE_MSG_IDS`、最大100件保持）で行い、可視化のために Gmail 処理済みラベルも付与するため、ユーザーが先にメールを既読にしたり Gmail のスレッドまとめ機能が有効であっても取りこぼしや二重起票が発生しません。
 
 ---
 
@@ -89,6 +93,11 @@ GASのプロジェクト設定で、以下のスクリプトプロパティ（Sc
 | `SLACK_WEBHOOK_URL` | 必須 | 通知させたいSlackチャンネルのIncoming Webhook URL |
 | `APP_SECRET` | 必須 | 手動更新用URLに含める任意のパスワード（トークン）文字列 |
 | `HATENA_RSS_URL` | 任意 | 取得対象のRSS。デフォルトは `https://b.hatena.ne.jp/hotentry/it.rss` |
+| `GITHUB_TOKEN` | 任意 | GASエラー通知からGitHub Issueを自動起票するための Fine-grained Personal Access Token（対象リポジトリの `Issues: Read and write` 権限のみ付与）。未設定時は自動起票をスキップ |
+| `GITHUB_REPO` | 任意 | Issue起票先リポジトリ（`owner/repo` 形式）。デフォルトは `lightyield/ai-hatebu-digest` |
+| `GAS_FAILURE_PROJECT_FILTER` | 任意 | 監視対象とするGASプロジェクト名（カンマ区切り）。デフォルトは `ai-hatebu-digest,無題のプロジェクト`（`*` または空文字で全プロジェクト対象） |
+| `GAS_FAILURE_PROCESSED_LABEL` | 任意 | 処理済みメールに付与するGmailラベル名。デフォルトは `gas-failure-reported`（未存在時は自動作成） |
+| `GITHUB_ISSUE_LABELS` | 任意 | 自動起票するIssueへ付与するラベル名（カンマ区切り）。未設定時はラベルなし |
 
 ---
 
@@ -132,6 +141,17 @@ GASのプロジェクト設定で、以下のスクリプトプロパティ（Sc
      - 時間ベースのトリガーのタイプを選択: **日付ベースのタイマー**
      - 時刻を選択: **午前 7時〜8時**（お好みの時間）
    - 「保存」をクリックします。
+7. **GASエラー通知メール監視トリガーの設定（任意・Issue自動起票を利用する場合）**:
+   - （推奨）Apps Script エディタ左上のプロジェクト名を `ai-hatebu-digest` に変更しておくと、複数プロジェクト運用時にも件名で確実に識別できます。
+   - GitHub の Settings > Developer settings > Personal access tokens > Fine-grained tokens から、対象リポジトリのみに `Issues: Read and write` 権限を付与したトークンを発行し、GAS のスクリプトプロパティ `GITHUB_TOKEN` に設定します。
+   - Apps Script エディタ上で関数 `watchGasFailureEmails` を選択して一度手動実行し、Gmail アクセス権限の承認プロンプトを許可します。
+   - 左メニューの「トリガー」 > 「トリガーを追加」から以下を設定します：
+     - 実行する関数を選択: `watchGasFailureEmails`
+     - 実行するデプロイを選択: `Head`
+     - イベントのソースを選択: **時間主導型**
+     - 時間ベースのトリガーのタイプを選択: **時間ベースのタイマー**
+     - 時間の間隔を選択: **1時間おき**（お好みの間隔）
+   - 「保存」をクリックします。
 
 ---
 
@@ -150,8 +170,8 @@ GASのプロジェクト設定で、以下のスクリプトプロパティ（Sc
    ```
 
 ### テストの構成・特徴
-- **モック化**: `PropertiesService`, `UrlFetchApp`, `XmlService`, `SpreadsheetApp`, `ContentService`, `Utilities` などの GAS 固有クラスを Jest で擬似的に再現し、通信やストレージを伴わない高速なテストを実現しています。
-- **検証範囲**: [src/Code.test.js](src/Code.test.js) にて、トークン認証、エラーハンドリング、二重送信防止、Gemini APIの動的モデル取得とLite優先・特性分散フィルタリング・最大件数制限、Gemini 2.5系限定の `thinkingBudget: 0` による思考抑制と汎用400時の自動除外再試行・モデル固有400時のフォールバック・APIキー不正400時の即時サーキットブレーカー、一時的な API 障害時のリトライ/リカバリ処理、遅延503時の即時フォールバック、一時的過負荷（503）時の後続継続処理、直前成功モデルの優先昇格、レートリミット（429）時の即時サーキットブレーカー、アクセス不可記事・非テキスト（PDF等）・短文コンテンツのスキップ仕様、巨大HTML・不正タグの安全な線形時間クレンジング、Gemini APIの安全性フィルターブロック時のハンドリング、5段階の多段階実行時間上限ガード機能、および重大例外・タイムアウト強制終了時のクラッシュリカバリ（再試行ループ防止）など、全54件のテストケースを網羅しています。
+- **モック化**: `PropertiesService`, `UrlFetchApp`, `XmlService`, `SpreadsheetApp`, `ContentService`, `Utilities`, `GmailApp` などの GAS 固有クラスを Jest で擬似的に再現し、通信やストレージを伴わない高速なテストを実現しています。
+- **検証範囲**: [src/Code.test.js](src/Code.test.js) にて、トークン認証、エラーハンドリング、二重送信防止、Gemini APIの動的モデル取得とLite優先・特性分散フィルタリング・最大件数制限、Gemini 2.5系限定の `thinkingBudget: 0` による思考抑制と汎用400時の自動除外再試行・モデル固有400時のフォールバック・APIキー不正400時の即時サーキットブレーカー、一時的な API 障害時のリトライ/リカバリ処理、遅延503時の即時フォールバック、一時的過負荷（503）時の後続継続処理、直前成功モデルの優先昇格、レートリミット（429）時の即時サーキットブレーカー、アクセス不可記事・非テキスト（PDF等）・短文コンテンツのスキップ仕様、巨大HTML・不正タグの安全な線形時間クレンジング、Gemini APIの安全性フィルターブロック時のハンドリング、5段階の多段階実行時間上限ガード機能、重大例外・タイムアウト強制終了時のクラッシュリカバリ（再試行ループ防止）、および GASエラー通知メールの解析・プロジェクトフィルタ・GitHub Issue自動起票・重複起票防止・Slack連携など、全65件のテストケースを網羅しています。
 - **本番との互換性**: [src/Code.js](src/Code.js) の末尾で `module.exports` をエクスポートする際、GASのランタイム環境を壊さないためのガード処理（`typeof module !== 'undefined'`）を施しています。
 
 ---

@@ -73,6 +73,14 @@ global.Utilities = {
   sleep: jest.fn(),
 };
 
+/** GmailApp モック */
+const mockGmailLabel = { getName: jest.fn(() => 'gas-failure-reported') };
+global.GmailApp = {
+  search: jest.fn(() => []),
+  getUserLabelByName: jest.fn(() => mockGmailLabel),
+  createLabel: jest.fn(() => mockGmailLabel),
+};
+
 // ============================================================
 // テスト対象モジュールのロード
 // ============================================================
@@ -87,6 +95,13 @@ const {
   extractPlainTextFromHtml,
   isHtmlOrTextContentType,
   syncAndNotify,
+  extractProjectNameFromFailureSubject,
+  matchesGasFailureProjectFilter,
+  parseGasFailureEmail,
+  buildGasFailureIssuePayload,
+  createGitHubIssue,
+  processGasFailureEmails,
+  watchGasFailureEmails,
 } = require('./Code');
 
 // ============================================================
@@ -119,6 +134,11 @@ beforeEach(() => {
   global.SpreadsheetApp.getActiveSpreadsheet.mockReturnValue({
     getSheetByName: jest.fn(() => mockSheet),
   });
+
+  // GmailApp のデフォルトモックをリセット
+  global.GmailApp.search.mockReset().mockReturnValue([]);
+  global.GmailApp.getUserLabelByName.mockReset().mockReturnValue(mockGmailLabel);
+  global.GmailApp.createLabel.mockReset().mockReturnValue(mockGmailLabel);
 });
 
 // ------------------------------------------------------------
@@ -1989,4 +2009,255 @@ function setupFetchMocksForArticles(articles) {
 function buildRssXml(articles) {
   return `<?xml version="1.0"?><rdf:RDF></rdf:RDF>`;
 }
+
+// ------------------------------------------------------------
+// GASエラー通知メール監視 & GitHub Issue 自動起票
+// ------------------------------------------------------------
+describe('GASエラー通知メール監視・解析・GitHub Issue 自動起票', () => {
+  const sampleFailureHtml = `
+    <html><body>
+      <p>Your script, 無題のプロジェクト, has recently failed to finish successfully.</p>
+      <table>
+        <tr><th>Start</th><th>Function</th><th>Error Message</th><th>Trigger</th><th>End</th></tr>
+        <tr>
+          <td>11/22/26 3:36:16 PM JST</td>
+          <td>runCron</td>
+          <td>Exceeded maximum execution time</td>
+          <td>time-based</td>
+          <td>11/22/26 3:42:17 PM JST</td>
+        </tr>
+      </table>
+    </body></html>
+  `;
+
+  const makeMockMessage = ({
+    id = 'msg-1',
+    from = 'noreply-apps-scripts-notifications@google.com',
+    subject = 'Summary of failures for Google Apps Script: 無題のプロジェクト',
+    htmlBody = sampleFailureHtml,
+    plainBody = 'fallback plain text',
+    date = new Date('2026-11-23T06:42:00.000Z'),
+  } = {}) => ({
+    getId: jest.fn(() => id),
+    getFrom: jest.fn(() => from),
+    getSubject: jest.fn(() => subject),
+    getBody: jest.fn(() => htmlBody),
+    getPlainBody: jest.fn(() => plainBody),
+    getDate: jest.fn(() => date),
+  });
+
+  const makeMockThread = (messages) => ({
+    getMessages: jest.fn(() => messages),
+    addLabel: jest.fn(),
+  });
+
+  it('extractProjectNameFromFailureSubject() は英語・日本語の件名からプロジェクト名を正しく抽出する', () => {
+    expect(extractProjectNameFromFailureSubject('Summary of failures for Google Apps Script: 無題のプロジェクト'))
+      .toBe('無題のプロジェクト');
+    expect(extractProjectNameFromFailureSubject('Summary of failures for Google Apps Script: ai-hatebu-digest'))
+      .toBe('ai-hatebu-digest');
+    expect(extractProjectNameFromFailureSubject('Google Apps Script のエラーの概要：my-script'))
+      .toBe('my-script');
+    expect(extractProjectNameFromFailureSubject('コロンなし件名')).toBe('コロンなし件名');
+  });
+
+  it('matchesGasFailureProjectFilter() はカンマ区切りフィルタ・全許可ワイルドカードを正しく判定する', () => {
+    expect(matchesGasFailureProjectFilter('ai-hatebu-digest', 'ai-hatebu-digest,無題のプロジェクト')).toBe(true);
+    expect(matchesGasFailureProjectFilter('無題のプロジェクト', 'ai-hatebu-digest,無題のプロジェクト')).toBe(true);
+    expect(matchesGasFailureProjectFilter('AI-HATEBU-DIGEST', 'ai-hatebu-digest,無題のプロジェクト')).toBe(true);
+    expect(matchesGasFailureProjectFilter('other-project', 'ai-hatebu-digest,無題のプロジェクト')).toBe(false);
+    expect(matchesGasFailureProjectFilter('any-project', '*')).toBe(true);
+    expect(matchesGasFailureProjectFilter('any-project', '')).toBe(true);
+  });
+
+  it('parseGasFailureEmail() はHTMLテーブルから単一・複数エラー明細を抽出しエンティティをデコードする', () => {
+    const multiRowHtml = `
+      <table>
+        <tr><td>Start</td><td>Function</td><td>Error Message</td><td>Trigger</td><td>End</td></tr>
+        <tr>
+          <td>11/22/26 3:36:16 PM JST</td>
+          <td>runCron</td>
+          <td>Exceeded maximum execution time</td>
+          <td>time-based</td>
+          <td>11/22/26 3:42:17 PM JST</td>
+        </tr>
+        <tr>
+          <td>11/22/26 4:00:00 PM JST</td>
+          <td>doGet</td>
+          <td>TypeError: Cannot read &lt;prop&gt; &amp; value</td>
+          <td>web-app</td>
+          <td>11/22/26 4:00:02 PM JST</td>
+        </tr>
+      </table>
+    `;
+    const parsed = parseGasFailureEmail(
+      'Summary of failures for Google Apps Script: ai-hatebu-digest',
+      multiRowHtml,
+      ''
+    );
+    expect(parsed.projectName).toBe('ai-hatebu-digest');
+    expect(parsed.entries).toHaveLength(2);
+    expect(parsed.entries[0]).toEqual({
+      start: '11/22/26 3:36:16 PM JST',
+      func: 'runCron',
+      errorMessage: 'Exceeded maximum execution time',
+      trigger: 'time-based',
+      end: '11/22/26 3:42:17 PM JST',
+    });
+    expect(parsed.entries[1].errorMessage).toBe('TypeError: Cannot read <prop> & value');
+    expect(parsed.rawExcerpt).toBe('');
+  });
+
+  it('parseGasFailureEmail() はHTMLテーブルが無い場合にプレーンテキスト抜粋へフォールバックする', () => {
+    const parsed = parseGasFailureEmail(
+      'Summary of failures for Google Apps Script: ai-hatebu-digest',
+      '<div>テーブルなし形式</div>',
+      'Unexpected failure occurred in runCron'
+    );
+    expect(parsed.entries).toHaveLength(0);
+    expect(parsed.rawExcerpt).toBe('Unexpected failure occurred in runCron');
+  });
+
+  it('buildGasFailureIssuePayload() はタイトル・Markdownテーブル本文・任意ラベルを正しく生成する', () => {
+    const parsed = parseGasFailureEmail(
+      'Summary of failures for Google Apps Script: ai-hatebu-digest',
+      sampleFailureHtml,
+      ''
+    );
+    const payload = buildGasFailureIssuePayload(parsed, '2026-11-23T06:42:00.000Z', 'bug, gas-error');
+    expect(payload.title).toBe('[GAS Error] runCron: Exceeded maximum execution time (11/22/26 3:36:16 PM JST)');
+    expect(payload.body).toContain('| 11/22/26 3:36:16 PM JST | `runCron` | Exceeded maximum execution time | time-based | 11/22/26 3:42:17 PM JST |');
+    expect(payload.body).toContain('ai-hatebu-digest');
+    expect(payload.labels).toEqual(['bug', 'gas-error']);
+  });
+
+  it('processGasFailureEmails() は GITHUB_TOKEN 未設定時に安全にスキップする', () => {
+    mockPropStore.GITHUB_TOKEN = '';
+    const result = processGasFailureEmails();
+    expect(result).toEqual({ checkedThreads: 0, createdIssues: 0, skippedCount: 0 });
+    expect(global.GmailApp.search).not.toHaveBeenCalled();
+    expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
+  });
+
+  it('processGasFailureEmails() は対象プロジェクトのエラー通知からIssueを自動起票し、Slack通知・ID記録・ラベル自動作成付与を行う', () => {
+    mockPropStore.GITHUB_TOKEN = 'ghp_test_token';
+    mockPropStore.GITHUB_REPO = 'lightyield/ai-hatebu-digest';
+    mockPropStore.GITHUB_ISSUE_LABELS = 'bug';
+
+    const msg = makeMockMessage({ id: 'msg-101' });
+    const thread = makeMockThread([msg]);
+    global.GmailApp.search.mockReturnValue([thread]);
+    // ラベルが存在しないケース → createLabel が呼ばれることを検証
+    global.GmailApp.getUserLabelByName.mockReturnValue(null);
+
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url.includes('api.github.com/repos/lightyield/ai-hatebu-digest/issues')) {
+        return {
+          getResponseCode: jest.fn(() => 201),
+          getContentText: jest.fn(() => JSON.stringify({
+            number: 99,
+            html_url: 'https://github.com/lightyield/ai-hatebu-digest/issues/99',
+          })),
+        };
+      }
+      return {
+        getResponseCode: jest.fn(() => 200),
+        getContentText: jest.fn(() => 'ok'),
+      };
+    });
+
+    const result = processGasFailureEmails();
+    expect(result).toEqual({ checkedThreads: 1, createdIssues: 1, skippedCount: 0 });
+
+    // GitHub API 呼び出しの検証
+    const ghCall = global.UrlFetchApp.fetch.mock.calls.find(([u]) => u.includes('api.github.com'));
+    expect(ghCall).toBeDefined();
+    expect(ghCall[1].headers.Authorization).toBe('Bearer ghp_test_token');
+    const ghBody = JSON.parse(ghCall[1].payload);
+    expect(ghBody.title).toContain('[GAS Error] runCron: Exceeded maximum execution time');
+    expect(ghBody.labels).toEqual(['bug']);
+
+    // Slack 通知の検証
+    const slackCall = global.UrlFetchApp.fetch.mock.calls.find(([u]) => u === 'https://hooks.slack.com/test');
+    expect(slackCall).toBeDefined();
+    expect(slackCall[1].payload).toContain('https://github.com/lightyield/ai-hatebu-digest/issues/99');
+
+    // 重複防止用メッセージID保存とラベル自動作成・付与の検証
+    expect(JSON.parse(mockPropStore.REPORTED_GAS_FAILURE_MSG_IDS)).toEqual(['msg-101']);
+    expect(global.GmailApp.createLabel).toHaveBeenCalledWith('gas-failure-reported');
+    expect(thread.addLabel).toHaveBeenCalledWith(mockGmailLabel);
+  });
+
+  it('processGasFailureEmails() は処理済みメッセージIDを重複起票せず、同一スレッドの新着メッセージのみ起票する', () => {
+    mockPropStore.GITHUB_TOKEN = 'ghp_test_token';
+    mockPropStore.REPORTED_GAS_FAILURE_MSG_IDS = JSON.stringify(['msg-old']);
+
+    const oldMsg = makeMockMessage({ id: 'msg-old' });
+    const newMsg = makeMockMessage({ id: 'msg-new' });
+    const thread = makeMockThread([oldMsg, newMsg]);
+    global.GmailApp.search.mockReturnValue([thread]);
+
+    global.UrlFetchApp.fetch.mockImplementation((url) => {
+      if (url.includes('api.github.com')) {
+        return {
+          getResponseCode: jest.fn(() => 201),
+          getContentText: jest.fn(() => JSON.stringify({
+            number: 100,
+            html_url: 'https://github.com/lightyield/ai-hatebu-digest/issues/100',
+          })),
+        };
+      }
+      return { getResponseCode: jest.fn(() => 200), getContentText: jest.fn(() => 'ok') };
+    });
+
+    const result = processGasFailureEmails();
+    expect(result).toEqual({ checkedThreads: 1, createdIssues: 1, skippedCount: 1 });
+    const ghCalls = global.UrlFetchApp.fetch.mock.calls.filter(([u]) => u.includes('api.github.com'));
+    expect(ghCalls).toHaveLength(1);
+    expect(JSON.parse(mockPropStore.REPORTED_GAS_FAILURE_MSG_IDS)).toEqual(['msg-old', 'msg-new']);
+  });
+
+  it('processGasFailureEmails() はフィルタ対象外プロジェクトのエラー通知をスキップしラベルも付与しない', () => {
+    mockPropStore.GITHUB_TOKEN = 'ghp_test_token';
+    mockPropStore.GAS_FAILURE_PROJECT_FILTER = 'ai-hatebu-digest,無題のプロジェクト';
+
+    const otherMsg = makeMockMessage({
+      id: 'msg-other',
+      subject: 'Summary of failures for Google Apps Script: another-unrelated-project',
+    });
+    const thread = makeMockThread([otherMsg]);
+    global.GmailApp.search.mockReturnValue([thread]);
+
+    const result = processGasFailureEmails();
+    expect(result).toEqual({ checkedThreads: 1, createdIssues: 0, skippedCount: 1 });
+    expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
+    expect(thread.addLabel).not.toHaveBeenCalled();
+  });
+
+  it('processGasFailureEmails() はGitHub API失敗時にメッセージID記録・ラベル付与を行わず次回再試行可能にする', () => {
+    mockPropStore.GITHUB_TOKEN = 'ghp_invalid';
+
+    const msg = makeMockMessage({ id: 'msg-fail' });
+    const thread = makeMockThread([msg]);
+    global.GmailApp.search.mockReturnValue([thread]);
+
+    global.UrlFetchApp.fetch.mockReturnValue({
+      getResponseCode: jest.fn(() => 401),
+      getContentText: jest.fn(() => '{"message":"Bad credentials"}'),
+    });
+
+    const result = processGasFailureEmails();
+    expect(result).toEqual({ checkedThreads: 1, createdIssues: 0, skippedCount: 0 });
+    expect(mockPropStore.REPORTED_GAS_FAILURE_MSG_IDS).toBeUndefined();
+    expect(thread.addLabel).not.toHaveBeenCalled();
+  });
+
+  it('watchGasFailureEmails() は内部で例外が発生しても外に伝播しない', () => {
+    mockPropStore.GITHUB_TOKEN = 'ghp_test_token';
+    global.GmailApp.search.mockImplementation(() => {
+      throw new Error('Gmail temporary failure');
+    });
+    expect(() => watchGasFailureEmails()).not.toThrow();
+  });
+});
 
