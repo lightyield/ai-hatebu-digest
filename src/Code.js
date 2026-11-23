@@ -5,7 +5,12 @@ function getProperties() {
     GEMINI_API_KEY: props.GEMINI_API_KEY,
     SLACK_WEBHOOK_URL: props.SLACK_WEBHOOK_URL,
     APP_SECRET: props.APP_SECRET,
-    HATENA_RSS_URL: props.HATENA_RSS_URL || 'https://b.hatena.ne.jp/hotentry/it.rss'
+    HATENA_RSS_URL: props.HATENA_RSS_URL || 'https://b.hatena.ne.jp/hotentry/it.rss',
+    GITHUB_TOKEN: props.GITHUB_TOKEN || '',
+    GITHUB_REPO: props.GITHUB_REPO || 'lightyield/ai-hatebu-digest',
+    GAS_FAILURE_PROJECT_FILTER: props.GAS_FAILURE_PROJECT_FILTER !== undefined ? props.GAS_FAILURE_PROJECT_FILTER : 'ai-hatebu-digest,無題のプロジェクト',
+    GAS_FAILURE_PROCESSED_LABEL: props.GAS_FAILURE_PROCESSED_LABEL || 'gas-failure-reported',
+    GITHUB_ISSUE_LABELS: props.GITHUB_ISSUE_LABELS || ''
   };
 }
 
@@ -834,6 +839,436 @@ function syncAndNotify() {
 }
 
 // ----------------------------------------------------
+// GASエラー通知メール監視 & GitHub Issue 自動起票
+// ----------------------------------------------------
+
+const GAS_FAILURE_SENDER = 'noreply-apps-scripts-notifications@google.com';
+const REPORTED_GAS_FAILURE_MSG_IDS_KEY = 'REPORTED_GAS_FAILURE_MSG_IDS';
+const MAX_REPORTED_GAS_FAILURE_MSG_IDS = 100;
+
+/**
+ * GASエラー通知メールの件名からプロジェクト名を抽出する
+ * 例: "Summary of failures for Google Apps Script: ai-hatebu-digest" -> "ai-hatebu-digest"
+ * @param {string} subject
+ * @returns {string}
+ */
+function extractProjectNameFromFailureSubject(subject) {
+  if (!subject || typeof subject !== 'string') return '';
+  const colonIdx = Math.max(subject.indexOf(':'), subject.indexOf('：'));
+  if (colonIdx !== -1) {
+    return subject.substring(colonIdx + 1).trim();
+  }
+  return subject.trim();
+}
+
+/**
+ * 抽出されたプロジェクト名が監視対象フィルタに一致するか判定する
+ * フィルタが空または '*' の場合は全プロジェクトを対象とする
+ * @param {string} projectName
+ * @param {string} filterStr - カンマ区切りのプロジェクト名リスト
+ * @returns {boolean}
+ */
+function matchesGasFailureProjectFilter(projectName, filterStr) {
+  if (!filterStr || typeof filterStr !== 'string') return true;
+  const trimmed = filterStr.trim();
+  if (!trimmed || trimmed === '*') return true;
+  const targets = trimmed
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(s => s.length > 0);
+  if (targets.length === 0) return true;
+  const normalizedName = String(projectName || '').trim().toLowerCase();
+  return targets.includes(normalizedName);
+}
+
+/**
+ * 基本的なHTMLエンティティをデコードし空白を正規化する
+ * @param {string} text
+ * @returns {string}
+ */
+function decodeBasicHtmlEntities(text) {
+  if (!text || typeof text !== 'string') return '';
+  return text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * GASエラー通知メールを解析してプロジェクト名とエラー明細一覧を抽出する
+ * HTMLテーブル構造が変わった場合でもプレーンテキスト抜粋へ安全にフォールバックする
+ * @param {string} subject
+ * @param {string} htmlBody
+ * @param {string} plainBody
+ * @returns {{ projectName: string, entries: Array<{start: string, func: string, errorMessage: string, trigger: string, end: string}>, rawExcerpt: string }}
+ */
+function parseGasFailureEmail(subject, htmlBody, plainBody) {
+  const projectName = extractProjectNameFromFailureSubject(subject);
+  const entries = [];
+
+  if (htmlBody && typeof htmlBody === 'string') {
+    const safeHtml = htmlBody.length > 100000 ? htmlBody.substring(0, 100000) : htmlBody;
+    const rowMatches = safeHtml.match(/<tr\b[^>]*>[\s\S]*?<\/tr>/gi) || [];
+    for (let i = 0; i < rowMatches.length; i++) {
+      const rowHtml = rowMatches[i];
+      const cellMatches = rowHtml.match(/<td\b[^>]*>[\s\S]*?<\/td>/gi);
+      if (!cellMatches || cellMatches.length < 5) continue;
+      const cells = cellMatches.map(cell => {
+        const stripped = cell.replace(/<[^>]*>/g, ' ');
+        return decodeBasicHtmlEntities(stripped);
+      });
+      // ヘッダー行が <td> で構成されている場合の安全除外
+      if (cells[0].toLowerCase() === 'start' && cells[1].toLowerCase() === 'function') {
+        continue;
+      }
+      entries.push({
+        start: cells[0],
+        func: cells[1],
+        errorMessage: cells[2],
+        trigger: cells[3],
+        end: cells[4]
+      });
+    }
+  }
+
+  let rawExcerpt = '';
+  if (entries.length === 0) {
+    const fallbackText = (plainBody && typeof plainBody === 'string' && plainBody.trim())
+      ? plainBody.trim()
+      : extractPlainTextFromHtml(htmlBody || '', 50000, 1500);
+    rawExcerpt = fallbackText.substring(0, 1500);
+  }
+
+  return { projectName, entries, rawExcerpt };
+}
+
+/**
+ * Markdownテーブルのセル内文字列を安全にエスケープする
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeMarkdownTableCell(value) {
+  return String(value || '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim();
+}
+
+/**
+ * 解析済みのGASエラー通知情報から GitHub Issue 作成用ペイロードを構築する
+ * @param {{ projectName: string, entries: Array, rawExcerpt: string }} parsed
+ * @param {string} receivedDateStr
+ * @param {string} [labelsStr='']
+ * @returns {{ title: string, body: string, labels?: string[] }}
+ */
+function buildGasFailureIssuePayload(parsed, receivedDateStr, labelsStr) {
+  let title = '';
+  if (parsed.entries && parsed.entries.length > 0) {
+    const first = parsed.entries[0];
+    const cleanErr = String(first.errorMessage || 'Error').replace(/\s+/g, ' ').trim();
+    const shortErr = cleanErr.length > 60 ? cleanErr.substring(0, 57) + '...' : cleanErr;
+    const moreSuffix = parsed.entries.length > 1 ? ` 他${parsed.entries.length - 1}件` : '';
+    const startPart = first.start ? ` (${first.start})` : '';
+    title = `[GAS Error] ${first.func || 'unknown'}: ${shortErr}${moreSuffix}${startPart}`;
+  } else {
+    title = `[GAS Error] ${parsed.projectName || 'Google Apps Script'} でエラー発生 (${receivedDateStr})`;
+  }
+  if (title.length > 150) {
+    title = title.substring(0, 147) + '...';
+  }
+
+  const lines = [
+    '## 発生概要',
+    '',
+    `- **GASプロジェクト**: ${parsed.projectName || '(不明)'}`,
+    `- **通知メール受信日時**: ${receivedDateStr}`,
+    `- **検出エラー件数**: ${parsed.entries ? parsed.entries.length : 0}件`,
+    ''
+  ];
+
+  if (parsed.entries && parsed.entries.length > 0) {
+    lines.push('## エラー詳細', '');
+    lines.push('| Start | Function | Error Message | Trigger | End |');
+    lines.push('| :--- | :--- | :--- | :--- | :--- |');
+    for (let i = 0; i < parsed.entries.length; i++) {
+      const e = parsed.entries[i];
+      lines.push(
+        `| ${escapeMarkdownTableCell(e.start)} | \`${escapeMarkdownTableCell(e.func)}\` | ${escapeMarkdownTableCell(e.errorMessage)} | ${escapeMarkdownTableCell(e.trigger)} | ${escapeMarkdownTableCell(e.end)} |`
+      );
+    }
+    lines.push('');
+  } else if (parsed.rawExcerpt) {
+    lines.push('## メール本文（抜粋）', '');
+    lines.push('```text');
+    lines.push(parsed.rawExcerpt);
+    lines.push('```', '');
+  }
+
+  lines.push('---');
+  lines.push('*本Issueは `watchGasFailureEmails` により GAS エラー通知メールから自動起票されました。*');
+
+  const payload = {
+    title: title,
+    body: lines.join('\n')
+  };
+
+  if (labelsStr && typeof labelsStr === 'string') {
+    const labels = labelsStr
+      .split(',')
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+    if (labels.length > 0) {
+      payload.labels = labels;
+    }
+  }
+
+  return payload;
+}
+
+/**
+ * GitHub REST API を呼び出して Issue を作成する
+ * @param {string} repo - "owner/repo" 形式
+ * @param {string} token - GitHub Personal Access Token
+ * @param {{ title: string, body: string, labels?: string[] }} issuePayload
+ * @returns {{ ok: boolean, number?: number, htmlUrl?: string, statusCode?: number, error?: string }}
+ */
+function createGitHubIssue(repo, token, issuePayload) {
+  const url = `https://api.github.com/repos/${repo}/issues`;
+  const res = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'ai-hatebu-digest-gas'
+    },
+    payload: JSON.stringify(issuePayload),
+    muteHttpExceptions: true
+  });
+
+  const statusCode = res.getResponseCode();
+  const bodyText = res.getContentText() || '';
+  if (statusCode === 201 || statusCode === 200) {
+    const data = JSON.parse(bodyText);
+    return {
+      ok: true,
+      number: data.number,
+      htmlUrl: data.html_url
+    };
+  }
+  return {
+    ok: false,
+    statusCode: statusCode,
+    error: bodyText
+  };
+}
+
+/**
+ * 自動起票した GitHub Issue のリンクを Slack へ通知する
+ * @param {string} webhookUrl
+ * @param {{ projectName: string, entries: Array }} parsed
+ * @param {{ number: number, htmlUrl: string }} issueResult
+ * @param {string} receivedDateStr
+ */
+function notifyGasFailureIssueToSlack(webhookUrl, parsed, issueResult, receivedDateStr) {
+  if (!webhookUrl) return;
+  const first = (parsed.entries && parsed.entries.length > 0) ? parsed.entries[0] : null;
+  const summaryLines = [
+    `*プロジェクト*: ${parsed.projectName || '(不明)'}`,
+    `*メール受信日時*: ${receivedDateStr}`
+  ];
+  if (first) {
+    summaryLines.push(`*関数*: \`${first.func}\``);
+    summaryLines.push(`*エラー*: ${first.errorMessage}`);
+    if (first.start) {
+      summaryLines.push(`*発生時刻*: ${first.start}`);
+    }
+  }
+  summaryLines.push(`*GitHub Issue*: <${issueResult.htmlUrl}|#${issueResult.number} を開く>`);
+
+  const blocks = [
+    {
+      type: 'header',
+      text: {
+        type: 'plain_text',
+        text: '🚨 GASエラー検知・GitHub Issue自動起票',
+        emoji: true
+      }
+    },
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: summaryLines.join('\n')
+      }
+    }
+  ];
+
+  try {
+    UrlFetchApp.fetch(webhookUrl, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ blocks: blocks }),
+      muteHttpExceptions: true
+    });
+  } catch (err) {
+    console.warn('GASエラー自動起票のSlack通知に失敗しました: ', err);
+  }
+}
+
+/**
+ * 処理済みメッセージID一覧を ScriptProperties から読み込む
+ * @param {Object} scriptProps
+ * @returns {string[]}
+ */
+function loadReportedGasFailureMessageIds(scriptProps) {
+  if (!scriptProps || typeof scriptProps.getProperty !== 'function') return [];
+  const raw = scriptProps.getProperty(REPORTED_GAS_FAILURE_MSG_IDS_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch (e) {
+    console.warn('REPORTED_GAS_FAILURE_MSG_IDS の解析に失敗しました: ', e);
+    return [];
+  }
+}
+
+/**
+ * 処理済みメッセージID一覧を上限件数内で ScriptProperties へ保存する
+ * @param {Object} scriptProps
+ * @param {string[]} ids
+ */
+function saveReportedGasFailureMessageIds(scriptProps, ids) {
+  if (!scriptProps || typeof scriptProps.setProperty !== 'function') return;
+  const trimmed = ids.slice(-MAX_REPORTED_GAS_FAILURE_MSG_IDS);
+  scriptProps.setProperty(REPORTED_GAS_FAILURE_MSG_IDS_KEY, JSON.stringify(trimmed));
+}
+
+/**
+ * 指定名のGmailラベルを取得し、存在しなければ作成する
+ * @param {string} labelName
+ * @returns {Object|null}
+ */
+function getOrCreateGmailLabel(labelName) {
+  if (!labelName || typeof GmailApp === 'undefined') return null;
+  try {
+    return GmailApp.getUserLabelByName(labelName) || GmailApp.createLabel(labelName);
+  } catch (err) {
+    console.warn(`Gmailラベル (${labelName}) の取得・作成に失敗しました: `, err);
+    return null;
+  }
+}
+
+/**
+ * Gmail の GAS エラー通知メールを監視し、未処理のものを GitHub Issue として自動起票する
+ * 重複起票防止はメッセージIDの永続化（ScriptProperties）で行い、可視化のために Gmail ラベルも付与する
+ * （Gmail のスレッドまとめ機能が有効でも翌日の新規メッセージを取りこぼさない設計）
+ * @returns {{ checkedThreads: number, createdIssues: number, skippedCount: number }}
+ */
+function processGasFailureEmails() {
+  const props = getProperties();
+  if (!props.GITHUB_TOKEN) {
+    console.warn('[GASエラー監視] GITHUB_TOKEN が未設定のため、Issue自動起票をスキップします。');
+    return { checkedThreads: 0, createdIssues: 0, skippedCount: 0 };
+  }
+  if (typeof GmailApp === 'undefined') {
+    console.warn('[GASエラー監視] GmailApp が利用できない環境のためスキップします。');
+    return { checkedThreads: 0, createdIssues: 0, skippedCount: 0 };
+  }
+
+  const scriptProps = PropertiesService.getScriptProperties();
+  const reportedIds = loadReportedGasFailureMessageIds(scriptProps);
+  const query = `from:${GAS_FAILURE_SENDER} newer_than:14d`;
+  const threads = GmailApp.search(query, 0, 20);
+
+  let createdIssues = 0;
+  let skippedCount = 0;
+  let processedLabel = null;
+
+  for (let t = 0; t < threads.length; t++) {
+    const thread = threads[t];
+    const messages = thread.getMessages();
+    let hasMatchedTarget = false;
+    let allMatchedSucceeded = true;
+
+    for (let m = 0; m < messages.length; m++) {
+      const msg = messages[m];
+      const from = typeof msg.getFrom === 'function' ? String(msg.getFrom() || '') : '';
+      if (!from.toLowerCase().includes(GAS_FAILURE_SENDER)) {
+        continue;
+      }
+
+      const msgId = String(msg.getId());
+      if (reportedIds.includes(msgId)) {
+        skippedCount++;
+        continue;
+      }
+
+      const subject = msg.getSubject() || '';
+      const htmlBody = typeof msg.getBody === 'function' ? (msg.getBody() || '') : '';
+      const plainBody = typeof msg.getPlainBody === 'function' ? (msg.getPlainBody() || '') : '';
+      const parsed = parseGasFailureEmail(subject, htmlBody, plainBody);
+
+      if (!matchesGasFailureProjectFilter(parsed.projectName, props.GAS_FAILURE_PROJECT_FILTER)) {
+        skippedCount++;
+        continue;
+      }
+
+      hasMatchedTarget = true;
+      const msgDate = typeof msg.getDate === 'function' && msg.getDate() ? msg.getDate() : new Date();
+      const receivedDateStr = msgDate instanceof Date ? msgDate.toISOString() : String(msgDate);
+      const issuePayload = buildGasFailureIssuePayload(parsed, receivedDateStr, props.GITHUB_ISSUE_LABELS);
+
+      const issueResult = createGitHubIssue(props.GITHUB_REPO, props.GITHUB_TOKEN, issuePayload);
+      if (issueResult.ok) {
+        console.log(`[GASエラー監視] GitHub Issue を自動起票しました: #${issueResult.number} (${issueResult.htmlUrl})`);
+        createdIssues++;
+        reportedIds.push(msgId);
+        saveReportedGasFailureMessageIds(scriptProps, reportedIds);
+        notifyGasFailureIssueToSlack(props.SLACK_WEBHOOK_URL, parsed, issueResult, receivedDateStr);
+      } else {
+        console.error(`[GASエラー監視] GitHub Issue の作成に失敗しました (HTTP ${issueResult.statusCode}): `, issueResult.error);
+        allMatchedSucceeded = false;
+      }
+    }
+
+    if (hasMatchedTarget && allMatchedSucceeded) {
+      if (!processedLabel) {
+        processedLabel = getOrCreateGmailLabel(props.GAS_FAILURE_PROCESSED_LABEL);
+      }
+      if (processedLabel && typeof thread.addLabel === 'function') {
+        try {
+          thread.addLabel(processedLabel);
+        } catch (labelErr) {
+          console.warn('処理済みGmailラベルの付与に失敗しました: ', labelErr);
+        }
+      }
+    }
+  }
+
+  return {
+    checkedThreads: threads.length,
+    createdIssues: createdIssues,
+    skippedCount: skippedCount
+  };
+}
+
+/**
+ * 時間主導型トリガー用: GASエラー通知メール監視のエントリーポイント
+ */
+function watchGasFailureEmails() {
+  try {
+    return processGasFailureEmails();
+  } catch (err) {
+    console.error('GASエラー通知メール監視中に予期せぬエラーが発生しました: ', err);
+  }
+}
+
+// ----------------------------------------------------
 // テストおよびデバッグ用ユーティリティ
 // ----------------------------------------------------
 
@@ -1026,6 +1461,13 @@ if (typeof module !== 'undefined') {
     extractPlainTextFromHtml,
     isHtmlOrTextContentType,
     syncAndNotify,
+    extractProjectNameFromFailureSubject,
+    matchesGasFailureProjectFilter,
+    parseGasFailureEmail,
+    buildGasFailureIssuePayload,
+    createGitHubIssue,
+    processGasFailureEmails,
+    watchGasFailureEmails,
     runDiagnostics
   };
 }
