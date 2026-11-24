@@ -195,3 +195,7 @@ GitHub Actions を利用し、`main` ブランチへのマージ/プッシュを
 | :--- | :--- |
 | `CLASPRC_JSON` | `~/.clasprc.json` の内容（ローカルで `npx clasp login` を実行して生成された認証用JSONデータ） |
 | `CLASP_JSON` | `.clasp.json` の内容（`scriptId` や `rootDir` などの設定情報を含むJSONデータ。セキュリティのためリポジトリにはコミットされません） |
+| `DEPENDABOT_ALERTS_TOKEN` | Dependabot alerts の自動 Issue 化ワークフロー用 Fine-grained PAT（`Dependabot alerts: Read-only` 権限のみ付与） |
+
+### Dependabot alerts の自動 Issue 化
+[.github/workflows/dependabot-alerts-to-issues.yml](.github/workflows/dependabot-alerts-to-issues.yml) により、毎日 09:00 JST（または手動実行 `workflow_dispatch`）にオープン中の Dependabot alerts を取得し、パッケージ単位で GitHub Issue（ラベル: `security`, `dependabot`）を自動作成・更新します。対象パッケージのアラートがすべて解消されると該当 Issue を自動的にクローズします。
